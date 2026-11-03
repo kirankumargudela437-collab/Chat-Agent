@@ -226,6 +226,7 @@ def test_rules_tell_the_model_not_to_embellish(tmp_path):
     SQLAgent(llm, db, schema_linking=False, value_lookup=False).run("q?")
     system = llm.prompts[0][0].content
     assert "no extra columns" in system and "GROUP BY their key column" in system and "bridge table" in system
+    assert "SELECT * FROM X's table alone" in system
 
 
 FLIGHT_A = """
@@ -261,11 +262,45 @@ def test_router_prompt_shows_the_evidence(tmp_path):
     make_db(tmp_path / "dbs" / "flight_1" / "flight_1.sqlite", FLIGHT_B)
     cat = DatabaseCatalog(tmp_path / "dbs")
     llm = RecordingLLM(responses=["flight_2", "SELECT count(*) FROM airports WHERE City = 'Aberdeen '"], prompts=[])
-    agent = SQLAgent(llm, catalog=cat, schema_linking=False)
+    agent = SQLAgent(llm, catalog=cat, schema_linking=False, route_margin=99)  # always ask the model
     r = agent.run("How many airports are in Aberdeen?")
     assert r.database == "flight_2" and r.rows == [(1,)]
     router_prompt = llm.prompts[0][0].content
     assert "Matches the question:" in router_prompt and "Aberdeen" in router_prompt
+
+
+def test_clear_fit_winner_skips_the_model(tmp_path):
+    make_db(tmp_path / "dbs" / "flight_2" / "flight_2.sqlite", FLIGHT_A)
+    make_db(tmp_path / "dbs" / "flight_1" / "flight_1.sqlite", FLIGHT_B)
+    cat = DatabaseCatalog(tmp_path / "dbs")
+    # Were the model asked, it would pick the wrong database.
+    llm = RecordingLLM(responses=["SELECT count(*) FROM airports WHERE City = 'Aberdeen '"], prompts=[])
+    agent = SQLAgent(llm, catalog=cat, schema_linking=False)
+    r = agent.run("How many airports are in Aberdeen?")
+    assert r.database == "flight_2" and r.rows == [(1,)]
+    assert len(llm.prompts) == 1 and "Pick" not in llm.prompts[0][0].content
+
+
+def test_close_call_asks_the_model_among_the_top_two_only(tmp_path):
+    for name in ("alpha", "beta", "gamma"):
+        make_db(tmp_path / "dbs" / name / f"{name}.sqlite", "CREATE TABLE singer (id INTEGER, name TEXT);")
+    cat = DatabaseCatalog(tmp_path / "dbs")
+    llm = RecordingLLM(responses=["beta", "SELECT count(*) FROM singer"], prompts=[])
+    agent = SQLAgent(llm, catalog=cat, schema_linking=False, db_candidates=3)
+    db, candidates = agent.route("How many singers are there?")
+    assert len(candidates) == 3 and db in candidates[:2]
+    router_prompt = llm.prompts[0][0].content
+    assert sum(n in router_prompt for n in ("alpha", "beta", "gamma")) == 2
+
+
+def test_route_only_reports_fit_margins(tmp_path):
+    make_db(tmp_path / "dbs" / "flight_2" / "flight_2.sqlite", FLIGHT_A)
+    make_db(tmp_path / "dbs" / "flight_1" / "flight_1.sqlite", FLIGHT_B)
+    cat = DatabaseCatalog(tmp_path / "dbs")
+    ex = bm.Example("1", "flight_2", "How many airports are in Aberdeen?", "SELECT 1")
+    out = list(bm.route_only(cat, [ex], k=2))
+    assert out[0].margin > 0.15
+    assert "Fit lead >= 0.15: 100.0% (1/1) of questions, #1 right in 100.0% (1/1)" in bm.summarize(out, True)
 
 
 def test_route_only_uses_fit(tmp_path):

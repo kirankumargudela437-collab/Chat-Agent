@@ -321,6 +321,7 @@ _RULES = (
     "- Prefer readable CTEs over nested subqueries; use window functions (ROW_NUMBER, RANK, LAG, LEAD, "
     "SUM() OVER) where they fit; guard divisions with NULLIF and handle NULLs with COALESCE.\n"
     "- Return exactly the columns the question asks for, in the order it asks; no extra columns.\n"
+    "- For 'all the information / all details about X', SELECT * FROM X's table alone, with no joins.\n"
     "- Do not add filters, conditions or joins the question does not ask for. Put parentheses around mixed AND/OR.\n"
     "- When counting or grouping people or things, GROUP BY their key column (id), not their name: names repeat.\n"
     "- If two tables only connect through a third (a bridge table), join through it using the foreign keys.\n"
@@ -454,6 +455,8 @@ class SQLAgent:
         db_candidates: int = 5,
         value_lookup: bool = True,
         sql_candidates: int = 1,
+        route_margin: float = 0.15,
+        route_choices: int = 2,
     ):
         """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
         self.llm = llm
@@ -462,6 +465,8 @@ class SQLAgent:
             raise ValueError("DOCQA_DB_ROUTER must be 'llm' or 'retrieval'")
         self.db_router = db_router
         self.db_candidates = max(1, db_candidates)
+        self.route_margin = route_margin  # schema-fit lead that settles routing without the model
+        self.route_choices = max(2, route_choices)  # how many of the ranked databases the model chooses from
         self.database_name = ""
         self._vectors_by_db: dict[str, dict[str, list[float]] | None] = {}
         self.embeddings = embeddings  # to pick the relevant tables of a big database
@@ -559,12 +564,20 @@ class SQLAgent:
         candidates = [n for n, _ in self.catalog.rank(question, self.db_candidates)]
         if len(candidates) <= 1:
             return candidates[0], candidates
+        scores: dict[str, float] = {}
         candidates, evidence = rerank_by_fit(
-            self.catalog, question, candidates, self._values_for if self.value_lookup else None
+            self.catalog, question, candidates, self._values_for if self.value_lookup else None, scores
         )
-        if self.db_router == "llm":
-            return self.catalog.choose(question, candidates, self.llm, evidence), candidates
-        return candidates[0], candidates
+        if self.db_router != "llm":
+            return candidates[0], candidates
+        # A small model asked to pick among five look-alikes overrides a correct #1 more
+        # often than it fixes a wrong one, so a clear schema-fit winner is kept as is and
+        # the model only breaks close calls, between the top few.
+        if scores and scores[candidates[0]] - scores[candidates[1]] >= self.route_margin:
+            log.info("Routing: %s leads on schema fit, no model call", candidates[0])
+            return candidates[0], candidates
+        shortlist = candidates[: self.route_choices]
+        return self.catalog.choose(question, shortlist, self.llm, evidence), candidates
 
     def _values_for(self, key: str, db):
         if key not in self._value_indexes:
@@ -759,7 +772,9 @@ class SQLAgent:
         yield from self._summary.stream(self.summary_inputs(r))
 
 
-def rerank_by_fit(catalog, question: str, candidates: list[str], values_for=None) -> tuple[list[str], dict[str, str]]:
+def rerank_by_fit(
+    catalog, question: str, candidates: list[str], values_for=None, scores: dict | None = None
+) -> tuple[list[str], dict[str, str]]:
     """Reorder routing candidates by how well each database's names and values cover the question.
 
     Look-alike databases (flight_1 / flight_2 / flight_4) rank close together on
@@ -767,6 +782,7 @@ def rerank_by_fit(catalog, question: str, candidates: list[str], values_for=None
     question actually uses separates them. The retrieval rank still counts (a small
     penalty per place), so a clear retrieval winner is not overturned by one word.
     ``values_for(name, db)`` returns a ``ValueIndex`` (cached by the caller) or None.
+    ``scores``, if given, is filled with each candidate's ranking score.
     """
     fit, evidence = {}, {}
     for n in candidates:
@@ -777,7 +793,10 @@ def rerank_by_fit(catalog, question: str, candidates: list[str], values_for=None
             log.debug("No routing evidence for %s: %s", n, e)
             fit[n], evidence[n] = 0.0, ""
     order = {n: i for i, n in enumerate(candidates)}
-    ranked = sorted(candidates, key=lambda n: (-(fit[n] - 0.05 * order[n]), order[n]))
+    adjusted = {n: fit[n] - 0.05 * order[n] for n in candidates}
+    ranked = sorted(candidates, key=lambda n: (-adjusted[n], order[n]))
+    if scores is not None:
+        scores.update(adjusted)  # the ranking score of each candidate, for the caller's margin check
     return ranked, evidence
 
 

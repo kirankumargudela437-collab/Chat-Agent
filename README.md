@@ -326,6 +326,18 @@ docqa eval spider --limit 50 --shots 4 --sql-candidates 3 # plus voting (slow on
 docqa eval bird --limit 30 --no-values                    # measure one feature at a time
 ```
 
+**Round 3, from the round-2 Spider run.** The shortlist improved (gold database in the
+top 5 for 94% of questions, schema fit alone puts it first 83.5% of the time), yet the
+final pick got slightly worse: given five look-alike cards, the 7B model overrode a
+correct #1 (employee_hire_evaluation → shop_membership, course_teach → gymnast). So:
+
+* **Trust a clear fit winner.** If #1 leads #2 on schema fit by `DOCQA_ROUTE_MARGIN`
+  (0.15), it is used without a model call. Otherwise the model chooses among only the top
+  `DOCQA_ROUTE_CHOICES` (2). `--route-margin 99` restores always asking.
+  `docqa eval spider --route-only` now prints, per margin, how many questions have a clear
+  lead and how often that #1 is right, so the margin can be tuned without a chat model.
+* **"All the information about X"** now means `SELECT * FROM X`, with no joins.
+
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
 tells you to download in a browser and pass `--zip`. The schema indexer built `PRAGMA table_info('{t}')`

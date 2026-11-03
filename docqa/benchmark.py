@@ -381,6 +381,7 @@ class Outcome:
     gold_error: str = ""
     difficulty: str = ""
     seconds: float = 0.0
+    margin: float | None = None  # route-only: schema-fit lead of #1 over #2
 
 
 def evaluate(
@@ -458,9 +459,12 @@ def route_only(catalog, examples: Iterable[Example], k: int = 5, fit: bool = Tru
         if fit and len(ranked) > 1:
             from .sql import rerank_by_fit
 
-            ranked, _ = rerank_by_fit(catalog, q, ranked, values_for)
+            scores: dict = {}
+            ranked, _ = rerank_by_fit(catalog, q, ranked, values_for, scores)
         out = Outcome(ex.id, ex.db_id, ex.question, ex.gold_sql, routed_db=ranked[0] if ranked else "",
                       candidates=ranked, difficulty=ex.difficulty)
+        if fit and len(ranked) > 1:
+            out.margin = round(scores[ranked[0]] - scores[ranked[1]], 4)
         out.correct = out.routed_db == ex.db_id
         out.seconds = round(time.monotonic() - start, 3)
         yield out
@@ -480,6 +484,15 @@ def summarize(outcomes: list[Outcome], route_only_mode: bool = False, routed: bo
         k = max((len(o.candidates) for o in scored), default=0)
         lines.append(f"Routing top-1 accuracy: {_pct(len(right_db), n)}")
         lines.append(f"Gold database in top {k}: {_pct(in_top, n)}")
+        if k > 2:
+            lines.append(f"Gold database in top 2: {_pct(sum(o.db_id in o.candidates[:2] for o in scored), n)}")
+        with_margin = [o for o in scored if o.margin is not None]
+        for m in (0.1, 0.15, 0.25) if with_margin else ():
+            clear = [o for o in with_margin if o.margin >= m]
+            lines.append(
+                f"Fit lead >= {m}: {_pct(len(clear), len(with_margin))} of questions, "
+                f"#1 right in {_pct(sum(o.routed_db == o.db_id for o in clear), len(clear))}"
+            )
     else:
         lines.append(f"Execution accuracy: {_pct(sum(o.correct for o in scored), n)}")
         if routed:

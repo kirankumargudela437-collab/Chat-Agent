@@ -50,6 +50,8 @@ def build_sql_agent(settings: Settings, llm=None, catalog=None):
         db_candidates=settings.sql_db_candidates,
         value_lookup=settings.sql_value_lookup,
         sql_candidates=settings.sql_candidates,
+        route_margin=settings.sql_route_margin,
+        route_choices=settings.sql_route_choices,
     )
 
 

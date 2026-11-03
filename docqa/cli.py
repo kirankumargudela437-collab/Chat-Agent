@@ -253,6 +253,8 @@ def cmd_eval(args) -> int:
             db_candidates=k,
             value_lookup=s.sql_value_lookup and not args.no_values,
             sql_candidates=args.sql_candidates or s.sql_candidates,
+            route_margin=s.sql_route_margin if args.route_margin is None else args.route_margin,
+            route_choices=args.route_choices or s.sql_route_choices,
         )
         bank = None
         if args.shots:
@@ -280,7 +282,7 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
@@ -367,6 +369,9 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--route-only", action="store_true", help="only test database routing; no chat model needed")
     ev.add_argument("--router", choices=["llm", "retrieval"], help="override DOCQA_DB_ROUTER")
     ev.add_argument("--candidates", type=int, help="databases the router considers (default DOCQA_DB_CANDIDATES=5)")
+    ev.add_argument("--route-margin", type=float,
+                    help="schema-fit lead that skips the model's database pick (default DOCQA_ROUTE_MARGIN=0.15; 99 = always ask)")
+    ev.add_argument("--route-choices", type=int, help="the model picks among this many top databases (default DOCQA_ROUTE_CHOICES=2)")
     ev.add_argument("--no-fit", action="store_true", help="route-only: rank by retrieval alone, without schema/value fit")
     ev.add_argument("--no-embeddings", action="store_true", help="route with keyword search only")
     ev.add_argument("--no-linking", action="store_true", help="skip the schema-linking call (faster, usually less accurate)")
