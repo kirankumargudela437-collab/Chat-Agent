@@ -316,6 +316,9 @@ after the hint. So:
 * **Stricter rules** in the SQL prompt: only the asked-for columns, no extra filters,
   group by key not name, join through bridge tables, NOT IN / EXCEPT for negation,
   ORDER BY ... LIMIT 1 for "the most recent", parentheses around mixed AND/OR.
+* **BIRD evidence with the question.** The per-question hint ("youngest refers to
+  MAX(Birthday)") is now appended to the question, as BIRD's own baselines do, instead of
+  sitting in the context where the 7B model ignored it.
 
 ```bash
 docqa eval spider --limit 50 --shots 4                    # values + error hints + 4 examples

@@ -274,3 +274,9 @@ def test_route_only_uses_fit(tmp_path):
     cat = DatabaseCatalog(tmp_path / "dbs")
     ex = bm.Example("1", "flight_2", "How many airports are in Aberdeen?", "SELECT 1")
     assert next(bm.route_only(cat, [ex], k=2)).correct
+
+
+def test_bird_evidence_travels_with_the_question():
+    assert bm.with_evidence("Youngest patient?", "youngest refers to MAX(Birthday)") == (
+        "Youngest patient?\nHint (definitions to follow exactly): youngest refers to MAX(Birthday)")
+    assert bm.with_evidence("q?", "") == "q?"

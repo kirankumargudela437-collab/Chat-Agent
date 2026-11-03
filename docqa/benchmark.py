@@ -408,10 +408,12 @@ def evaluate(
             yield out
             continue
         start = time.monotonic()
-        context = f"[1] (source: benchmark evidence)\n{ex.evidence}" if ex.evidence else ""
+        # BIRD's evidence goes with the question, as in BIRD's own baselines: buried in the
+        # context the 7B model ignored it ("youngest = MAX(Birthday)" -> it wrote MIN)
+        question = with_evidence(ex.question, ex.evidence)
         try:
             shown = bank.similar(ex.question, shots, exclude_db=ex.db_id) if bank and shots else None
-            r = agent.run(ex.question, context=context, database=ex.db_id if oracle_db else None, examples=shown)
+            r = agent.run(question, context="", database=ex.db_id if oracle_db else None, examples=shown)
             out.pred_sql, out.attempts, out.routed_db, out.candidates = r.sql, r.attempts, r.database, r.candidates
             if r.error:
                 out.error = r.error
@@ -422,6 +424,13 @@ def evaluate(
             out.error = f"{type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}"
         out.seconds = round(time.monotonic() - start, 2)
         yield out
+
+
+def with_evidence(question: str, evidence: str) -> str:
+    """The question plus BIRD's evidence as a hint the model must follow."""
+    if not evidence:
+        return question
+    return f"{question}\nHint (definitions to follow exactly): {evidence}"
 
 
 def route_only(catalog, examples: Iterable[Example], k: int = 5, fit: bool = True) -> Iterator[Outcome]:
@@ -444,11 +453,12 @@ def route_only(catalog, examples: Iterable[Example], k: int = 5, fit: bool = Tru
 
     for ex in examples:
         start = time.monotonic()
-        ranked = [n for n, _ in catalog.rank(ex.question, k)]
+        q = with_evidence(ex.question, ex.evidence)
+        ranked = [n for n, _ in catalog.rank(q, k)]
         if fit and len(ranked) > 1:
             from .sql import rerank_by_fit
 
-            ranked, _ = rerank_by_fit(catalog, ex.question, ranked, values_for)
+            ranked, _ = rerank_by_fit(catalog, q, ranked, values_for)
         out = Outcome(ex.id, ex.db_id, ex.question, ex.gold_sql, routed_db=ranked[0] if ranked else "",
                       candidates=ranked, difficulty=ex.difficulty)
         out.correct = out.routed_db == ex.db_id
