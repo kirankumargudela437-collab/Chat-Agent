@@ -4,20 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docqa"
-version = "0.1.0"
-description = "Q&A chat agent over a folder of changing PDF, DOCX and Markdown files (RAG with incremental indexing)."
+version = "0.2.0"
+description = "Chat agent over your business documents, source code and SQL databases (RAG with incremental indexing, routing and self-healing text-to-SQL)."
 requires-python = ">=3.10"
 dependencies = [
   "langchain-core>=1.0",
   "langchain-classic>=1.0",        # SQLRecordManager lives here in LangChain 1.x
   "langchain-text-splitters>=1.0",
-  "langchain-community>=0.4",
   "langchain-chroma>=1.0",
   "langchain-ollama>=1.0",
   "sqlalchemy[asyncio]>=2.0",      # SQLRecordManager imports the asyncio extension
   "pypdf>=5.0",
   "docx2txt>=0.9",
   "python-dotenv>=1.0",
+  "langgraph>=1.0",                # self-healing SQL loop
+  "sqlglot>=26",                   # parses generated SQL: read-only check, syntax errors per dialect
 ]
 
 [project.optional-dependencies]
@@ -25,7 +26,9 @@ openai = ["langchain-openai>=1.0"]
 anthropic = ["langchain-anthropic>=1.0"]
 google = ["langchain-google-genai>=3.0"]
 docling = ["langchain-docling>=1.0"]
-dev = ["pytest>=8", "reportlab>=4", "python-docx>=1.1"]
+office = ["openpyxl>=3.1", "python-pptx>=1.0"]   # .xlsx and .pptx files
+ui = ["streamlit>=1.40"]
+dev = ["pytest>=8", "reportlab>=4", "python-docx>=1.1", "streamlit>=1.40"]
 
 [project.scripts]
 docqa = "docqa.cli:main"

@@ -20,7 +20,8 @@ def test_loads_all_formats_with_citation_metadata(settings):
 def test_metadata_is_minimal_and_stable(settings):
     chunks, _ = load_and_split(settings)
     for c in chunks:
-        assert set(c.metadata) <= {"source", "page", "section"}
+        assert set(c.metadata) <= {"source", "page", "section", "category"}
+        assert c.metadata["category"] == "doc"
 
 
 def test_chunks_respect_size_and_overlap(settings):

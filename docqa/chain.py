@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Iterator, Sequence
+from typing import TYPE_CHECKING, Iterator, Sequence
 
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
@@ -28,13 +28,17 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.retrievers import BaseRetriever
 
+if TYPE_CHECKING:
+    from .sql import SQLResult
+
 NOT_FOUND = "I couldn't find that in the documents."
 
 CONDENSE_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You rewrite follow-up questions for a document search engine. You never answer them.\n"
+            "You rewrite follow-up questions for a search engine over documents, source code and "
+            "database schemas. You never answer them.\n"
             "Given a conversation and a follow-up question, rewrite the follow-up so it can be "
             "understood on its own, replacing pronouns and references like 'it' or 'that one' "
             "with what they refer to. If it is already standalone, return it unchanged.\n"
@@ -91,6 +95,43 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 
+CODE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a senior software engineer answering questions about the user's code.\n"
+            "Rules:\n"
+            "- Use ONLY the numbered code passages below. Do not guess about code you cannot see.\n"
+            "- Name the file and function or class you mean, and cite passages as [1], [2], etc.\n"
+            "- Quote short code snippets in fenced blocks when they help.\n"
+            "- If the passages do not contain the answer, reply exactly: "
+            f'"{NOT_FOUND}" and nothing else.\n'
+            "- Be concise.\n\n"
+            "Context:\n{context}",
+        ),
+        ("human", "{question}"),
+    ]
+)
+
+COMBINE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Several specialists answered parts of the user's question from their documents, code "
+            "and database. Write one combined answer.\n"
+            "Rules:\n"
+            "- Use ONLY the partial answers below. Keep their [n] citations exactly as written.\n"
+            "- Keep any SQL or code blocks exactly as written.\n"
+            "- If the parts disagree, say so. If none of them answers, reply exactly: "
+            f'"{NOT_FOUND}"\n'
+            "- Be concise.\n\n"
+            "Partial answers:\n{parts}",
+        ),
+        ("human", "{question}"),
+    ]
+)
+
+
 def citation_label(doc: Document) -> str:
     m = doc.metadata
     label = m.get("source", "unknown")
@@ -98,6 +139,10 @@ def citation_label(doc: Document) -> str:
         label += f", page {m['page']}"
     if m.get("section"):
         label += f", section \"{m['section']}\""
+    if m.get("lines"):
+        label += f", lines {m['lines']}"
+    if m.get("category") == "example":
+        label += " (golden SQL example)"
     return label
 
 
@@ -140,6 +185,8 @@ class Answer:
     question: str
     standalone_question: str
     docs: list[Document] = field(default_factory=list)
+    routes: tuple[str, ...] = ("DOC",)
+    sql: "SQLResult | None" = None  # set when a SQL query was generated
 
     @property
     def cited_docs(self) -> list[tuple[int, Document]]:
@@ -158,8 +205,17 @@ class Answer:
 
     @property
     def uncited(self) -> bool:
-        """An answer that claims something but cites no passage: treat with care."""
+        """An answer that claims something but cites no passage: treat with care.
+
+        A query that ran against the database is grounded in its result instead.
+        """
+        if self.sql is not None and self.sql.executed:
+            return False
         return not self.not_found and not self.cited_docs
+
+    @property
+    def route(self) -> str:
+        return "+".join(self.routes)
 
     def sources_text(self) -> str:
         return "\n".join(f"  [{i}] {citation_label(d)}" for i, d in self.cited_docs)
