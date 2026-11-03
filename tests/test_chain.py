@@ -3,7 +3,9 @@ from langchain_core.documents import Document
 from langchain_core.language_models import FakeListChatModel
 from langchain_core.retrievers import BaseRetriever
 
-from docqa.chain import NOT_FOUND, Answer, DocQA, format_docs
+import pytest
+
+from docqa.chain import NOT_FOUND, Answer, DocQA, clean_condensed, cited_indices, format_docs, is_not_found
 
 
 class SpyRetriever(BaseRetriever):
@@ -81,6 +83,72 @@ def test_stream_yields_tokens_then_answer():
     assert len(qa.history) == 2
 
 
-def test_uncited_answer_falls_back_to_all_retrieved():
+def test_uncited_answer_lists_no_sources():
+    # Listing every retrieved passage would make an unsupported answer look cited.
     ans = Answer("Thirty days.", "q", "q", DOCS)
-    assert len(ans.cited_docs) == 3
+    assert ans.cited_docs == [] and ans.uncited
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("Thirty days [1].", [1]),
+        ("Thirty days [1, 2].", [1, 2]),
+        ("Thirty days [1][3].", [1, 3]),
+        ("Thirty days [1-3].", [1, 2, 3]),
+        ("Thirty days [2,3] and [9].", [2, 3]),
+        ("Thirty days (Source 2).", []),
+        ("Thirty days [1-9999].", []),
+    ],
+)
+def test_citation_forms(text, expected):
+    assert cited_indices(text, 3) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        NOT_FOUND,
+        "I couldn't find that in the documents",
+        "i couldn’t find that in the documents!",
+        "I couldn't find that in the documents. However, refunds are usually 30 days.",
+    ],
+)
+def test_refusal_variants_have_no_sources(text):
+    ans = Answer(text, "q", "q", DOCS)
+    assert is_not_found(text) and ans.cited_docs == [] and not ans.uncited
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "How do I apply for a refund?",
+        "Here is the rewritten question: How do I apply for a refund?",
+        "Rewritten question: \"How do I apply for a refund?\"",
+        "Standalone question:\nHow do I apply for a refund?\n\nThis replaces 'it'.",
+    ],
+)
+def test_condensed_question_is_cleaned(raw):
+    assert clean_condensed(raw, "fallback") == "How do I apply for a refund?"
+
+
+def test_answer_step_sees_standalone_question_not_old_answers():
+    retriever = SpyRetriever(docs=DOCS, queries=[])
+    llm = RecordingLLM(responses=[
+        "Refunds are allowed within 30 days [1].",
+        "How do I apply for the refund policy?",
+        "Email billing@example.com [2].",
+    ], prompts=[])
+    qa = DocQA(llm, retriever)
+    qa.ask("What is the refund policy?")
+    qa.ask("How do I apply for it?")
+
+    # condense saw the history as text, with old citation markers stripped
+    condense_human = llm.prompts[1][-1].content
+    assert "Assistant: Refunds are allowed within 30 days." in condense_human
+    assert "[1]" not in condense_human
+
+    # answer step: system context + the standalone question only, no earlier turns
+    answer_msgs = llm.prompts[2]
+    assert len(answer_msgs) == 2
+    assert answer_msgs[1].content == "How do I apply for the refund policy?"

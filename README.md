@@ -62,18 +62,22 @@ DOCQA_EMBED_PROVIDER=ollama
 ```
 
 Anthropic has no embedding model, so pair `DOCQA_LLM_PROVIDER=anthropic` with
-Ollama or OpenAI embeddings. Each embedding model gets its own collection, so
-switching `DOCQA_EMBED_*` re-embeds into a fresh index rather than mixing vectors.
+Ollama or OpenAI embeddings. Each embedding model and docs folder gets its own
+collection, so switching `DOCQA_EMBED_*` or `--docs` builds a fresh index rather
+than mixing vectors or deleting the other folder's chunks.
+
+With Ollama, `DOCQA_NUM_CTX` (default 8192) sets the model's context window.
+Ollama's own default is small and it drops overflowing text without an error.
 
 ## How it handles the five "missing pieces"
 
 | Problem | What docqa does | Where |
 |---|---|---|
-| Changing files | LangChain indexing API with a SQLite record manager and `cleanup="full"`: unchanged chunks are skipped, edited files are replaced, deleted files are removed. | `docqa/indexing.py` |
+| Changing files | LangChain indexing API with a SQLite record manager and `cleanup="full"`: unchanged chunks are skipped, edited files are replaced, deleted files are removed. A file that fails to load keeps its previous chunks, and a sync that finds no files is refused unless you pass `--allow-empty`. | `docqa/indexing.py` |
 | Multi-format parsing | pypdf (per page), docx2txt, Markdown split by headings. Optional Docling (`DOCQA_USE_DOCLING=1`, `pip install -e ".[docling]"`) for tables and scanned PDFs. | `docqa/loaders.py` |
 | Chunking with overlap | `RecursiveCharacterTextSplitter`, 800 chars / 150 overlap by default (`DOCQA_CHUNK_SIZE`, `DOCQA_CHUNK_OVERLAP`). | `docqa/loaders.py` |
-| Follow-up questions | With history, the LLM first rewrites the question into a standalone one, and that is what gets searched. | `docqa/chain.py` |
-| Grounding and citations | Context is numbered and labelled with file, page and section; the prompt allows only that context, requires `[n]` citations, and has a fixed "not found" reply. The app prints the sources the answer actually cited. | `docqa/chain.py` |
+| Follow-up questions | With history, the LLM first rewrites the question into a standalone one, and that is what gets searched and answered. Earlier answers are not passed to the answer step, so their old citation numbers can't leak in. | `docqa/chain.py` |
+| Grounding and citations | Context is numbered and labelled with file, page and section; the prompt allows only that context, requires `[n]` citations, and has a fixed "not found" reply. The app prints only the sources the answer cited (`[1]`, `[1, 2]`, `[1-3]`) and flags an answer that cites none. | `docqa/chain.py` |
 
 ## Changes from the original blueprint
 
@@ -95,8 +99,11 @@ switching `DOCQA_EMBED_*` re-embeds into a fresh index rather than mixing vector
 * Scanned PDFs have no text layer; sync warns about them. Use Docling for OCR.
 * In Docling mode citations show file and section but not page numbers.
 * DOCX files have no page numbers to cite (Word computes pages at render time).
-* `cleanup="full"` means a file that fails to parse is removed from the index
-  until it parses again; sync lists it under `error`.
+* A file that fails to parse keeps its last indexed version; sync lists it under
+  `error`. A file that has never parsed is not in the index at all.
+* Run one writer at a time: `watch` and `chat` with `/sync` in two terminals both
+  write the same Chroma and SQLite files.
+* Chroma's anonymous telemetry is turned off.
 * Small local models follow the citation rules less reliably than large ones.
   `qwen2.5:7b` or `llama3.1:8b` are a reasonable floor.
 
@@ -121,5 +128,7 @@ pytest
 
 Tests use fake embeddings and a scripted chat model, so they need neither Ollama
 nor an API key. They cover loading all formats with citation metadata, overlap,
-incremental add/skip/edit/delete, persistence across runs, follow-up rewriting,
-grounded prompts, citations and the CLI.
+incremental add/skip/edit/delete, persistence across runs, the empty-folder and
+failed-file guards, follow-up rewriting, grounded prompts, citation parsing and
+the CLI. None of them run a real model, so try one `docqa chat` session with
+your model before relying on it.

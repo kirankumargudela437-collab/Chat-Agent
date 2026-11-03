@@ -29,27 +29,45 @@ def _settings(args: argparse.Namespace) -> Settings:
 def cmd_sync(args) -> int:
     s = _settings(args)
     print(f"Syncing {s.docs_dir} ({s.embed_provider}:{s.embed_model}) ...")
-    print(sync_documents(s).summary())
+    print(sync_documents(s, allow_empty=args.allow_empty).summary())
     return 0
 
 
 def cmd_watch(args) -> int:
-    """Poll the folder and re-sync when any file's size or mtime changes."""
+    """Poll the folder and re-sync when any file's size or mtime changes.
+
+    A failed sync (model server restarting, a file vanishing mid-scan) is logged and
+    retried on the next tick instead of stopping the watcher.
+    """
     s = _settings(args)
     vs, rm = open_vectorstore(s), open_record_manager(s)
     from .loaders import iter_files
 
     def snapshot():
-        return {(p, p.stat().st_mtime_ns, p.stat().st_size) for p in iter_files(s.docs_dir, s.extensions)}
+        snap = set()
+        for p in iter_files(s.docs_dir, s.extensions):
+            try:
+                st = p.stat()
+            except FileNotFoundError:  # deleted between listing and stat
+                continue
+            snap.add((p, st.st_mtime_ns, st.st_size))
+        return snap
 
     last = None
     print(f"Watching {s.docs_dir} every {args.interval}s (Ctrl+C to stop)")
     try:
         while True:
-            snap = snapshot()
-            if snap != last:
-                print(time.strftime("%H:%M:%S"), sync_documents(s, vs, rm).summary(), flush=True)
-                last = snap
+            try:
+                snap = snapshot()
+                if snap != last:
+                    res = sync_documents(s, vs, rm)
+                    print(time.strftime("%H:%M:%S"), res.summary(), flush=True)
+                    # files that failed to load (locked, still downloading) are retried next tick
+                    last = None if res.report.errors else snap
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:  # keep watching; `last` is unchanged so the next tick retries
+                print(time.strftime("%H:%M:%S"), f"sync failed, retrying in {args.interval}s: {e}", flush=True)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         return 0
@@ -60,6 +78,8 @@ def _print_answer(ans: Answer, show_query: bool) -> None:
         print(f"  (searched for: {ans.standalone_question})")
     if ans.cited_docs:
         print("Sources:\n" + ans.sources_text())
+    elif ans.uncited:
+        print("Sources: none cited. This answer may not come from your documents.")
 
 
 def cmd_ask(args) -> int:
@@ -116,7 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true", help="show rewritten follow-up queries")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("sync", help="index new/changed files, drop deleted ones").set_defaults(func=cmd_sync)
+    sy = sub.add_parser("sync", help="index new/changed files, drop deleted ones")
+    sy.add_argument("--allow-empty", action="store_true", help="allow a sync of an empty folder to clear the index")
+    sy.set_defaults(func=cmd_sync)
 
     w = sub.add_parser("watch", help="keep the index in sync while files change")
     w.add_argument("--interval", type=float, default=10.0, help="seconds between checks")
