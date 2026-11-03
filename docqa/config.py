@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 try:  # python-dotenv is optional at runtime
@@ -33,6 +33,10 @@ def _env(name: str, default: str) -> str:
     return value if value not in (None, "") else default
 
 
+def _flag(name: str, default: str) -> bool:
+    return _env(name, default).lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class Settings:
     docs_dir: Path = Path("./my_files")
@@ -48,9 +52,30 @@ class Settings:
     use_docling: bool = False
     temperature: float = 0.0
     num_ctx: int = 8192
-    extensions: tuple[str, ...] = field(default=(".pdf", ".docx", ".md", ".markdown", ".txt"))
+    # code and SQL
+    include_code: bool = True
+    code_chunk_size: int = 1500
+    code_chunk_overlap: int = 150
+    max_file_kb: int = 1024
+    database_url: str | None = None
+    sql_dialect: str = ""            # used without a database; with one, taken from database_url
+    sql_tables: tuple[str, ...] = ()  # limit the live schema to these tables (big databases)
+    sql_max_attempts: int = 3
+    sql_max_rows: int = 50
+    sql_schema_linking: bool = True
+    extensions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not self.extensions:
+            from .loaders import supported_extensions
+
+            self.extensions = supported_extensions(self.include_code)
+        from .sql import dialect_from_url
+
+        if self.database_url:  # a connected database decides; DOCQA_SQL_DIALECT is for when there is none
+            self.sql_dialect = dialect_from_url(self.database_url)
+        elif not self.sql_dialect:
+            self.sql_dialect = "postgres"
         self.llm_provider = self.llm_provider.lower()
         self.embed_provider = self.embed_provider.lower()
         if not self.llm_model:
@@ -59,6 +84,10 @@ class Settings:
             self.embed_model = DEFAULT_EMBED_MODELS.get(self.embed_provider, "")
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("DOCQA_CHUNK_OVERLAP must be smaller than DOCQA_CHUNK_SIZE")
+        if self.code_chunk_overlap >= self.code_chunk_size:
+            raise ValueError("DOCQA_CODE_CHUNK_OVERLAP must be smaller than DOCQA_CODE_CHUNK_SIZE")
+        if self.sql_max_attempts < 1:
+            raise ValueError("DOCQA_SQL_MAX_ATTEMPTS must be at least 1")
 
     @classmethod
     def from_env(cls, env_file: str | os.PathLike | None = ".env") -> "Settings":
@@ -75,8 +104,18 @@ class Settings:
             chunk_size=int(_env("DOCQA_CHUNK_SIZE", "800")),
             chunk_overlap=int(_env("DOCQA_CHUNK_OVERLAP", "150")),
             top_k=int(_env("DOCQA_TOP_K", "4")),
-            use_docling=_env("DOCQA_USE_DOCLING", "0").lower() in ("1", "true", "yes"),
+            use_docling=_flag("DOCQA_USE_DOCLING", "0"),
             num_ctx=int(_env("DOCQA_NUM_CTX", "8192")),
+            include_code=_flag("DOCQA_INCLUDE_CODE", "1"),
+            code_chunk_size=int(_env("DOCQA_CODE_CHUNK_SIZE", "1500")),
+            code_chunk_overlap=int(_env("DOCQA_CODE_CHUNK_OVERLAP", "150")),
+            max_file_kb=int(_env("DOCQA_MAX_FILE_KB", "1024")),
+            database_url=os.getenv("DOCQA_DATABASE_URL") or None,
+            sql_dialect=_env("DOCQA_SQL_DIALECT", "").lower(),
+            sql_tables=tuple(t.strip() for t in _env("DOCQA_SQL_TABLES", "").split(",") if t.strip()),
+            sql_max_attempts=int(_env("DOCQA_SQL_MAX_ATTEMPTS", "3")),
+            sql_max_rows=int(_env("DOCQA_SQL_MAX_ROWS", "50")),
+            sql_schema_linking=_flag("DOCQA_SQL_SCHEMA_LINKING", "1"),
         )
 
     @property
