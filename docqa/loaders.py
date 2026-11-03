@@ -50,6 +50,7 @@ _MD_HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3")]
 DOC_EXTENSIONS = (".pdf", ".docx", ".md", ".markdown", ".txt", ".rst", ".csv")
 OPTIONAL_DOC_EXTENSIONS = {".xlsx": "openpyxl", ".pptx": "pptx"}
 SQL_EXTENSIONS = (".sql",)
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 # Extensions with a LangChain language-aware splitter (splits on class / def / {} first).
 LANGUAGE_BY_EXT: dict[str, Language] = {
@@ -76,6 +77,11 @@ GENERIC_CODE_EXTENSIONS = (
     ".tf", ".hcl", ".dockerfile", ".graphql", ".gql", ".xml",
 )
 
+# Files that usually hold credentials. They are never indexed, so their contents can't
+# end up in a prompt (or at a cloud model). The list follows Continue's default ignores.
+SECRET_DIRS = {"secrets", "secret", "keys", "certs", "certificates", "private", "credentials"}
+_SECRET_NAME = re.compile(r"(secret|credential|passwords?\b|^id_(rsa|dsa|ecdsa|ed25519)|\.env\b)", re.IGNORECASE)
+
 # Folders that hold dependencies or build output, never your own code.
 IGNORED_DIRS = {
     "node_modules", "__pycache__", "venv", "env", "site-packages", "dist", "build", "target",
@@ -87,8 +93,10 @@ _GENERIC_SEPARATORS = ["\n\n\n", "\n\n", "\n", " ", ""]
 _QUESTION = re.compile(r"^\s*--\s*(?:golden\s+)?(?:q|question)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
 
-def supported_extensions(include_code: bool = True) -> tuple[str, ...]:
+def supported_extensions(include_code: bool = True, use_docling: bool = False) -> tuple[str, ...]:
     exts = list(DOC_EXTENSIONS) + [e for e, mod in OPTIONAL_DOC_EXTENSIONS.items() if importlib.util.find_spec(mod)]
+    if use_docling:
+        exts += list(IMAGE_EXTENSIONS)  # screenshots, scanned pages: OCR through Docling
     if include_code:
         exts += list(SQL_EXTENSIONS) + list(LANGUAGE_BY_EXT) + list(GENERIC_CODE_EXTENSIONS)
     return tuple(exts)
@@ -127,7 +135,9 @@ def iter_files(folder: Path, extensions: tuple[str, ...]) -> list[Path]:
         parts = p.relative_to(folder).parts
         if any(part.startswith(".") for part in parts):  # .git, .venv, .env, hidden files
             continue
-        if any(part.lower() in IGNORED_DIRS for part in parts[:-1]):
+        if any(part.lower() in IGNORED_DIRS or part.lower() in SECRET_DIRS for part in parts[:-1]):
+            continue
+        if _SECRET_NAME.search(p.stem):
             continue
         if p.name.startswith("~$") or ".min." in p.name.lower():  # Office lock files, minified bundles
             continue
@@ -231,7 +241,7 @@ def _load_markdown_text(text: str, rel: str) -> list[Document]:
 def load_file(path: Path, rel: str, use_docling: bool = False) -> list[Document]:
     """Load a document file into unsplit Documents (code and SQL go through ``load_code``)."""
     ext = path.suffix.lower()
-    if use_docling and ext in (".pdf", ".docx"):
+    if (use_docling and ext in (".pdf", ".docx")) or ext in IMAGE_EXTENSIONS:
         return _load_docling(path, rel)
     if ext == ".pdf":
         return _load_pdf(path, rel)

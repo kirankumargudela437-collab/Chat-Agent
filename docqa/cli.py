@@ -1,4 +1,4 @@
-"""Command line: ``docqa sync | watch | ask | chat | sample | ui``."""
+"""Command line: ``docqa sync | watch | ask | chat | describe-db | sample | ui``."""
 
 from __future__ import annotations
 
@@ -123,8 +123,9 @@ def cmd_chat(args) -> int:
     db = f" and {s.database_url.split('@')[-1]}" if s.database_url else ""
     print(f"Chatting with {s.llm_provider}:{s.llm_model} over {s.docs_dir}{db}.")
     print(
-        "Commands: /sql, /code or /doc before a question forces that route; /golden saves the last "
-        "query as a golden example; /sync re-index; /reset clear history; /quit exit.\n"
+        "Commands: /sql, /code or /doc before a question forces that route; /run <SQL> runs your own "
+        "query read-only; /golden saves the last query as a golden example; /sync re-index; "
+        "/reset clear history; /quit exit.\n"
     )
     last_sql = None
     while True:
@@ -169,6 +170,25 @@ def cmd_chat(args) -> int:
                 last_sql = final.sql
             _print_answer(final, args.verbose)
         print()
+
+
+def cmd_describe_db(args) -> int:
+    from .providers import make_llm
+    from .sql import draft_data_dictionary, open_database
+
+    s = _settings(args)
+    if not s.database_url:
+        raise ValueError("No database: set DOCQA_DATABASE_URL or pass --db.")
+    out = Path(args.out) if args.out else s.docs_dir / "data_dictionary_draft.md"
+    if out.exists() and not args.force:
+        raise ValueError(f"{out} already exists (you may have edited it). Pass --force to overwrite.")
+    db = open_database(s.database_url, s.sql_tables)
+    tables = [t.strip() for t in args.tables.split(",") if t.strip()] if args.tables else None
+    print(f"Describing {len(tables or db.table_names)} tables with {s.llm_provider}:{s.llm_model} ...")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(draft_data_dictionary(make_llm(s), db, tables), encoding="utf-8")
+    print(f"Wrote {out}. Review it, fix the (guess) lines, then run: docqa sync")
+    return 0
 
 
 def cmd_sample(args) -> int:
@@ -225,6 +245,12 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("chat", help="interactive chat with follow-up questions")
     c.add_argument("--sync", action="store_true", help="sync before starting")
     c.set_defaults(func=cmd_chat)
+
+    dd = sub.add_parser("describe-db", help="draft a data dictionary from the database, for you to correct")
+    dd.add_argument("--tables", help="comma-separated tables (default: all)")
+    dd.add_argument("--out", help="output file (default: <docs>/data_dictionary_draft.md)")
+    dd.add_argument("--force", action="store_true", help="overwrite an existing draft")
+    dd.set_defaults(func=cmd_describe_db)
 
     sa = sub.add_parser("sample", help="create sample docs, code, SQL and a SQLite database to try the agent")
     sa.add_argument("folder", nargs="?", default="sample_workspace")

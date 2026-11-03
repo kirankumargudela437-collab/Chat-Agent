@@ -89,7 +89,12 @@ Sources:
    The planner is skipped when only one kind of content is indexed or you force a route.
 3. **Each planned specialist runs once**, searching only its own chunks (every chunk is
    tagged `doc`, `code`, `sql` or `example` at sync time). If that finds nothing it
-   searches everything.
+   searches everything. Search is **hybrid**: vector similarity finds passages that mean
+   the same thing, BM25 keyword search finds exact names like `validate_request_token`,
+   `cust_stat_cd` or an error message, and the two lists are merged with reciprocal rank
+   fusion. Identifiers are split (`validateRequestToken` also matches "request token")
+   and file paths count three times, so naming a file finds it.
+   `DOCQA_HYBRID_SEARCH=0` uses vectors only.
 4. **With two or three specialists, one more call merges** their partial answers,
    keeping citations and SQL.
 
@@ -113,6 +118,10 @@ blank lines. To add another extension, add it to `LANGUAGE_BY_EXT` or
 * `node_modules`, `venv`, `dist`, `build`, `target`, `vendor`, `bin`, `obj`, hidden
   folders and `*.min.*` files are skipped, as are code and text files over
   `DOCQA_MAX_FILE_KB` (1024).
+* Files that usually hold secrets are never indexed, so they can't end up in a prompt:
+  `.env*`, `id_rsa` and other SSH keys, names containing `secret`, `credential` or
+  `password`, and anything inside `secrets/`, `keys/`, `certs/`, `private/` or
+  `credentials/` folders.
 * `DOCQA_CODE_CHUNK_SIZE` (1500) and `DOCQA_CODE_CHUNK_OVERLAP` (150) are separate
   from the document chunk size.
 * `DOCQA_INCLUDE_CODE=0` indexes documents only.
@@ -162,14 +171,26 @@ survives an index rebuild and can be edited like any other file.
 
 * sqlglot must parse exactly one statement whose root is a `SELECT` / `UNION` /
   `INTERSECT` / `EXCEPT`, with no `INSERT`, `UPDATE`, `DELETE`, `MERGE`, DDL, `PRAGMA`,
-  `ATTACH` or `SELECT INTO` anywhere inside it, CTEs included;
+  `ATTACH`, `SELECT INTO` or `FOR UPDATE` anywhere inside it, CTEs included;
+* functions that read files, reach the network or stall the server are refused even
+  inside a `SELECT`: `pg_read_file`, `lo_import`, `dblink`, `pg_sleep`, `load_file`,
+  `load_extension`, `read_csv`, `openrowset`, `xp_cmdshell`, `utl_http` and similar
+  (a denylist modelled on WrenAI's);
 * the connection is read-only: SQLite is opened with `mode=ro`, PostgreSQL and MySQL
   sessions are set to read-only transactions, and every query is rolled back;
 * at most `DOCQA_SQL_MAX_ROWS` (50) rows are fetched.
 
 For SQL Server, Snowflake, BigQuery and others, connect with a **read-only database
 user**: that is the only guarantee the database itself enforces. Large databases:
-`DOCQA_SQL_TABLES=orders,customers` limits the schema sent to the model. Install the
+`DOCQA_SQL_TABLES=orders,customers` limits the schema sent to the model.
+
+**Run your own query.** `/run SELECT ...` in chat or the app checks and runs a query you
+wrote, with the same read-only rules, and explains the result.
+
+**Start a data dictionary from the database.** `docqa describe-db --out docs/data_dictionary.md`
+asks the model to describe each table and column from the schema and sample rows. Every
+line is a guess marked for review: correct it, then sync, and it becomes the business
+layer for later questions. It refuses to overwrite a file unless you pass `--force`. Install the
 driver for your database yourself (`psycopg`, `pymysql`, `pyodbc`, `snowflake-sqlalchemy`, ...).
 
 ## Using it for several organisations
@@ -304,18 +325,26 @@ print(ans.sql.sql, ans.sql.columns, ans.sql.rows)
 
 ## Open-source projects worth knowing
 
-You don't need any of these to use docqa, but they're good to compare against or borrow ideas from:
+All ten projects below were read for this build. No code is copied from any of them; the
+ideas listed were reimplemented here and are credited.
 
-* **Vanna** (MIT; text-to-SQL trained on DDL, docs and past queries): the closest match to the SQL
-  route. Two ideas here come from reading its `generate_sql`: picking the related tables per question
-  instead of sending the whole schema, and passing golden examples as earlier chat turns. No code is
-  copied. Use Vanna itself if SQL is all you need and you want its UI and integrations.
-* **WrenAI** (semantic layer + GenBI app): use it when many people need governed metrics and charts,
-  not one person's chat.
-* **Continue / Aider / Cody** (code assistants in the editor or terminal): better for editing code;
-  docqa only answers questions about it.
-* **RAGFlow / AnythingLLM / Verba** (full document RAG apps): stronger PDF layout and table parsing.
-  docqa's `DOCQA_USE_DOCLING=1` covers the common cases.
+| Project | License | Idea used in docqa | Use it instead when |
+|---|---|---|---|
+| Vanna | MIT | related tables per question; golden examples as earlier chat turns | SQL is all you need and you want its UI and integrations |
+| WrenAI | Apache-2.0 (docs CC BY 4.0) | denylist of dangerous SQL functions; draft table and column descriptions for review (`describe-db`) | many people need governed metrics and charts |
+| SQLAIAgent-Ollama | no license file | running a query you wrote (`/run`) | (cannot be reused: no license) |
+| SmolSQLAgents | MIT | confirmed the retry-with-error loop and keeping the schema small | you want a smolagents-based agent |
+| AnythingLLM | MIT | uploading files from the app | you want a full multi-user document workspace |
+| RAGFlow | Apache-2.0 | hybrid keyword + vector search; OCR for images | you need its deep PDF layout and table parsing |
+| Verba | BSD-3-Clause | hybrid search with weighted fusion | you want a Weaviate-based document app |
+| Continue | Apache-2.0 | BM25 over code with file paths weighted up; skipping secret files | editing code in VS Code or JetBrains |
+| Aider | Apache-2.0 | matching identifiers in the question to files | editing code from the terminal |
+| Cody (public snapshot; the main repo is now private) | Apache-2.0 | keyword search split on symbol names | editing code with Sourcegraph |
+
+Ideas looked at and not taken: a LangGraph supervisor that re-decides after every step
+(see "How a question is answered"), WrenAI's full semantic-layer model (MDL), which is a
+separate product to maintain, and Aider's tree-sitter repo map, which needs a native
+parser per language where the LangChain splitters need none.
 
 ## Tests
 

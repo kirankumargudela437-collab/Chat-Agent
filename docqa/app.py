@@ -69,7 +69,7 @@ def _agent(env_file: str, docs_dir: str, db_url: str, dialect: str, schema: str)
         sql = SQLAgent(llm, db, dialect=s.sql_dialect, max_attempts=s.sql_max_attempts,
                        max_rows=s.sql_max_rows, schema_linking=s.sql_schema_linking,
                        max_tables=s.sql_max_tables, schema_chars=s.sql_schema_chars)
-        st.session_state.agent = Agent(llm, vs, top_k=s.top_k, sql_agent=sql)
+        st.session_state.agent = Agent(llm, vs, top_k=s.top_k, sql_agent=sql, hybrid=s.hybrid_search)
         st.session_state.agent_key = key
         st.session_state.messages = []
     agent = st.session_state.agent
@@ -137,8 +137,20 @@ def main() -> None:
             st.error(str(e))
             st.stop()
 
+        uploads = st.file_uploader(
+            "Add files (documents, code, .sql, schemas)",
+            accept_multiple_files=True,
+            help="Saved into an 'uploads' folder inside the files folder, then indexed.",
+        )
         allow_empty = st.checkbox("Allow a sync to empty the index", value=False)
-        if st.button("Sync folder", use_container_width=True):
+        save_uploads = bool(uploads) and st.button("Save uploads and sync", use_container_width=True)
+        if save_uploads:
+            target = Path(docs_dir) / "uploads"
+            target.mkdir(parents=True, exist_ok=True)
+            for f in uploads:
+                (target / Path(f.name).name).write_bytes(f.getvalue())
+        sync_clicked = st.button("Sync folder", use_container_width=True)
+        if save_uploads or sync_clicked:
             s = _settings(args.env_file, docs_dir, db_url, dialect)
             vs, rm = _index(args.env_file, docs_dir)
             with st.spinner("Indexing new and changed files..."):
@@ -180,7 +192,7 @@ def main() -> None:
         with st.chat_message(msg["role"]):
             _render(msg, i, docs_dir)
 
-    question = st.chat_input("Ask about your documents, code or data...")
+    question = st.chat_input("Ask about your documents, code or data... (/run SELECT ... runs your own query)")
     if not question:
         return
     st.session_state.messages.append({"role": "user", "content": question})

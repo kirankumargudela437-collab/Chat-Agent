@@ -43,6 +43,7 @@ from .chain import (
     clean_condensed,
     history_as_text,
 )
+from .keyword import KeywordIndex, doc_key, reciprocal_rank_fusion
 from .sql import SQLAgent, SQLResult, format_sql_answer
 
 ROUTES = ("SQL", "CODE", "DOC")
@@ -99,8 +100,10 @@ class Agent:
         max_history_messages: int = 8,
         schema: str = "",
         examples_k: int = 3,
+        hybrid: bool = True,
     ):
         self.llm = llm
+        self.hybrid = hybrid  # add keyword (BM25) search to vector search
         self.vectorstore = vectorstore
         self.top_k = top_k
         self.examples_k = examples_k
@@ -116,12 +119,14 @@ class Agent:
         self._code = CODE_PROMPT | llm | StrOutputParser()
         self._combine = COMBINE_PROMPT | llm | StrOutputParser()
         self._categories: set[str] | None = None
+        self._keyword: dict[str | None, KeywordIndex] = {}
 
     # -- index state ------------------------------------------------------------------
 
     def refresh(self) -> None:
         """Re-read which kinds of chunk the index holds (call after a sync)."""
         self._categories = None
+        self._keyword.clear()
 
     @property
     def categories(self) -> set[str]:
@@ -168,15 +173,33 @@ class Agent:
         routes = "\n".join(_ROUTE_HELP[r] for r in available)
         return parse_plan(self._plan.invoke({"routes": routes, "question": question}), available) or ["ALL"]
 
+    def _keyword_index(self, category: str | None) -> KeywordIndex:
+        if category not in self._keyword:
+            got = self.vectorstore.get(
+                where={"category": category} if category else None, include=["documents", "metadatas"]
+            )
+            docs = [Document(page_content=t, metadata=m or {}) for t, m in zip(got["documents"], got["metadatas"])]
+            self._keyword[category] = KeywordIndex(docs)
+        return self._keyword[category]
+
+    def _find(self, query: str, category: str | None, k: int) -> list[Document]:
+        """Vector search, plus keyword search fused in when ``hybrid`` is on."""
+        flt = {"filter": {"category": category}} if category else {}
+        if not self.hybrid:
+            return self.vectorstore.similarity_search(query, k=k, **flt)
+        vector = self.vectorstore.similarity_search(query, k=2 * k, **flt)
+        keyword = self._keyword_index(category).search(query, 2 * k)
+        return reciprocal_rank_fusion([vector, keyword], k)
+
     def search(self, query: str, category: str | None, k: int | None = None) -> list[Document]:
         k = k or self.top_k
         if category and category in self.categories:
-            docs = self.vectorstore.similarity_search(query, k=k, filter={"category": category})
+            docs = self._find(query, category, k)
             if docs:
                 return docs
         if category in ("sql", "example"):
             return []  # no schema or examples indexed: don't pad the SQL prompt with unrelated chunks
-        return self.vectorstore.similarity_search(query, k=k)
+        return self._find(query, None, k)
 
     def _sql_context(self, question: str) -> list[Document]:
         docs: list[Document] = []
@@ -184,12 +207,29 @@ class Agent:
         for cat, k in (("example", self.examples_k), ("sql", self.top_k), ("doc", self.top_k)):
             if cat not in self.categories:
                 continue
-            for d in self.vectorstore.similarity_search(question, k=k, filter={"category": cat}):
-                key = (d.metadata.get("source"), d.metadata.get("lines"), d.page_content[:80])
+            for d in self._find(question, cat, k):
+                key = doc_key(d)
                 if key not in seen:
                     seen.add(key)
                     docs.append(d)
         return docs
+
+    def run_sql(self, sql: str) -> SQLResult:
+        """Run the user's own SQL (``/run SELECT ...``) through the same read-only checks."""
+        from .sql import check_read_only, run_query
+
+        agent = self.sql_agent
+        r = SQLResult(question=f"/run {sql}", sql=sql.strip(), dialect=agent.dialect, attempts=1)
+        try:
+            r.sql = check_read_only(sql, agent.dialect)
+            if agent.db is None:
+                return r
+            res = run_query(agent.db, r.sql, agent.max_rows)
+        except Exception as e:
+            r.error = str(getattr(e, "orig", None) or e).strip().splitlines()[0]
+            return r
+        r.columns, r.rows, r.truncated, r.executed = res.columns, res.rows, res.truncated, True
+        return r
 
     # -- public -----------------------------------------------------------------------
 
@@ -202,6 +242,17 @@ class Agent:
 
     def stream(self, question: str, route: str | None = None) -> Iterator[str | Answer]:
         """Yields answer text as it arrives, then the final ``Answer``."""
+        m = re.match(r"^\s*/run\s+(.+)$", question, re.DOTALL | re.IGNORECASE)
+        if m:  # the user's own query: no model involved
+            r = self.run_sql(m.group(1))
+            if r.ok and r.executed:
+                more = ", more not shown" if r.truncated else ""
+                text = f"```sql\n{r.sql}\n```\n\n{len(r.rows)} rows{more}."
+            else:
+                text = format_sql_answer(r)
+            yield text
+            yield Answer(text, question, question, [], ("SQL",), r)
+            return
         standalone = self._standalone(question)
         routes = self.plan(standalone, route)
         docs: list[Document] = []

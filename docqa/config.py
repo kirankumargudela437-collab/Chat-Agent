@@ -63,6 +63,7 @@ class Settings:
     sql_max_attempts: int = 3
     sql_max_rows: int = 50
     sql_schema_linking: bool = True
+    hybrid_search: bool = True        # keyword (BM25) + vector search
     sql_max_tables: int = 20          # bigger databases: show only the most relevant tables
     sql_schema_chars: int = 12000     # cap on the schema text sent to the model
     extensions: tuple[str, ...] = ()
@@ -71,7 +72,7 @@ class Settings:
         if not self.extensions:
             from .loaders import supported_extensions
 
-            self.extensions = supported_extensions(self.include_code)
+            self.extensions = supported_extensions(self.include_code, self.use_docling)
         from .sql import dialect_from_url
 
         if self.database_url:  # a connected database decides; DOCQA_SQL_DIALECT is for when there is none
@@ -119,6 +120,7 @@ class Settings:
             sql_max_rows=int(_env("DOCQA_SQL_MAX_ROWS", "50")),
             sql_schema_linking=_flag("DOCQA_SQL_SCHEMA_LINKING", "1"),
             sql_max_tables=int(_env("DOCQA_SQL_MAX_TABLES", "20")),
+            hybrid_search=_flag("DOCQA_HYBRID_SEARCH", "1"),
             sql_schema_chars=int(_env("DOCQA_SQL_SCHEMA_CHARS", "12000")),
         )
 

@@ -41,4 +41,5 @@ def build_agent(settings: Settings | None = None, vectorstore=None, schema: str 
         top_k=settings.top_k,
         sql_agent=build_sql_agent(settings, llm),
         schema=schema,
+        hybrid=settings.hybrid_search,
     )
