@@ -72,6 +72,7 @@ class Settings:
     sql_answer_checks: bool = True    # EXPLAIN first; re-ask once when a result looks wrong (empty, NULLs, ...)
     sql_independent_plans: bool = False  # with several SQL candidates, each plans the question afresh
     sql_schema_ttl: float = 0.0       # seconds before the live schema is read again (0: once per session)
+    sql_answer_shape: bool = True     # the plan states the row entity, measure, grouping, denominator, ties
     sql_review: bool = False          # the model reviews its own query and first rows (one more call)
     sql_patterns: bool = True         # show worked examples of the SQL techniques the question needs
     sql_patterns_dir: Path | None = None  # your own pattern files (same format as docqa/sql_patterns)
@@ -147,6 +148,7 @@ class Settings:
             sql_patterns=_flag("DOCQA_SQL_PATTERNS", "1"),
             sql_answer_checks=_flag("DOCQA_SQL_CHECKS", "1"),
             sql_review=_flag("DOCQA_SQL_REVIEW", "0"),
+            sql_answer_shape=_flag("DOCQA_SQL_ANSWER_SHAPE", "1"),
             sql_schema_ttl=float(_env("DOCQA_SCHEMA_TTL", "0")),
             sql_independent_plans=_flag("DOCQA_SQL_INDEPENDENT", "0"),
             sql_patterns_dir=Path(os.environ["DOCQA_SQL_PATTERNS_DIR"]) if os.getenv("DOCQA_SQL_PATTERNS_DIR") else None,

@@ -274,6 +274,7 @@ def cmd_eval(args) -> int:
             answer_checks=s.sql_answer_checks and not args.no_checks,
             review=s.sql_review or args.review,
             independent_plans=s.sql_independent_plans or args.independent,
+            answer_shape=s.sql_answer_shape and not args.no_shape,
         )
         bank = None
         if args.shots:
@@ -312,7 +313,7 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'docs_full': args.docs_full, 'checks': s.sql_answer_checks and not args.no_checks, 'review': s.sql_review or args.review, 'independent': s.sql_independent_plans or args.independent, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'docs_full': args.docs_full, 'checks': s.sql_answer_checks and not args.no_checks, 'review': s.sql_review or args.review, 'independent': s.sql_independent_plans or args.independent, 'shape': s.sql_answer_shape and not args.no_shape, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
@@ -417,6 +418,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "technique on every question (the round 5b behaviour)")
     ev.add_argument("--no-checks", action="store_true", help="don't EXPLAIN first or re-ask on suspicious results "
                     "(empty, all NULL, duplicated rows, percentage outside 0-100)")
+    ev.add_argument("--no-shape", action="store_true", help="the plan does not state the answer shape "
+                    "(row entity, measure, denominator, ties); with --no-checks this isolates the schema fix")
     ev.add_argument("--independent", action="store_true", help="with --sql-candidates N: each extra candidate "
                     "plans the question afresh; the results show how often any candidate was right")
     ev.add_argument("--ids", help="a file of question ids (one per line, or a JSON list): run exactly these")

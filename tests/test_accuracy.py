@@ -704,3 +704,13 @@ def test_question_ids_file_and_candidate_summary(tmp_path):
     text = bm.summarize(outs)
     assert "some candidate right 100.0% (2/2)" in text and "picked a right one 50.0% (1/2)" in text
     assert "one line in 1 of 2" in text
+
+
+def test_answer_shape_can_be_switched_off_to_isolate_the_schema_fix():
+    from docqa.sql import LINK_PROMPT, SQLAgent
+
+    agent = SQLAgent(FakeListChatModel(responses=[]), sql_patterns=False, answer_shape=False)
+    base = agent._base({"schema": "", "question": "q"})
+    assert "Answer shape" not in LINK_PROMPT.format_messages(**base)[0].content
+    agent.answer_shape = True
+    assert "Answer shape" in LINK_PROMPT.format_messages(**agent._base({"schema": "", "question": "q"}))[0].content

@@ -93,7 +93,8 @@ def _agent(env_file: str, docs_dir: str, db_url: str, dialect: str, schema: str)
                        patterns_dir=str(s.sql_patterns_dir) if s.sql_patterns_dir else None,
                        route_margin=s.sql_route_margin, route_choices=s.sql_route_choices,
                        answer_checks=s.sql_answer_checks, review=s.sql_review,
-                       independent_plans=s.sql_independent_plans, schema_ttl=s.sql_schema_ttl)
+                       independent_plans=s.sql_independent_plans, schema_ttl=s.sql_schema_ttl,
+                       answer_shape=s.sql_answer_shape)
         st.session_state.agent = Agent(llm, vs, top_k=s.top_k, sql_agent=sql, hybrid=s.hybrid_search)
         st.session_state.agent_key = key
         st.session_state.messages = []

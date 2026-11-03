@@ -401,6 +401,14 @@ _RULES = (
     "{hint}"
 )
 
+ANSWER_SHAPE = (
+    "- Answer shape: what ONE result row is about (the entity), the measure it returns, any "
+    "grouping, the denominator of a ratio, and how ties are handled. When the question picks one "
+    "thing by a property ('the oldest player', 'the most expensive set'), say that it selects that "
+    "thing first and then returns its measure: 'the long passing score of the oldest player' is "
+    "one player's score, not MAX(long passing) over all players.\n"
+)
+
 LINK_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -410,11 +418,7 @@ LINK_PROMPT = ChatPromptTemplate.from_messages(
             "- Tables: the tables needed and how they join (exact key columns).\n"
             "- Columns and rules: how each business term in the question maps to columns, filters, "
             "status codes or formulas, citing the passage as [n].\n"
-            "- Answer shape: what ONE result row is about (the entity), the measure it returns, any "
-            "grouping, the denominator of a ratio, and how ties are handled. When the question picks one "
-            "thing by a property ('the oldest player', 'the most expensive set'), say that it selects that "
-            "thing first and then returns its measure: 'the long passing score of the oldest player' is "
-            "one player's score, not MAX(long passing) over all players.\n"
+            "{shape}"
             "- Gaps: anything the question needs that the schema and context do not define.\n"
             "Do not write the SQL. Be concise.{hint}\n\n"
             "Dialect: {dialect_name}\n\nSchema:\n{schema}\n\nContext:\n{context}",
@@ -540,6 +544,7 @@ class SQLAgent:
         review: bool = False,
         independent_plans: bool = False,
         schema_ttl: float = 0.0,
+        answer_shape: bool = True,
     ):
         """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
         self.llm = llm
@@ -573,6 +578,7 @@ class SQLAgent:
         self.answer_checks = answer_checks  # EXPLAIN first; re-ask once when a result looks wrong
         self.review = review  # the model reviews its own query and first rows (one extra call)
         self.independent_plans = independent_plans  # each extra candidate plans the question afresh
+        self.answer_shape = answer_shape  # the plan states what one result row is (entity, measure, ...)
         self.schema_ttl = schema_ttl  # seconds before the live schema is read again (0: once per session)
         self._schema_loaded = time.monotonic()
         self.error_help = None  # (error, sql) -> manual text shown when fixing a failed query
@@ -701,6 +707,7 @@ class SQLAgent:
         return {
             "dialect_name": dialect_name(self.dialect),
             "top_one": top_one(self.dialect),
+            "shape": ANSWER_SHAPE if self.answer_shape else "",
             "max_rows": self.max_rows,
             "schema": s["schema"],
             "context": s.get("context") or "(none)",
