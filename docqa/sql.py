@@ -47,6 +47,7 @@ from sqlglot import exp
 
 from .sqlchecks import (REVIEW_PROMPT, dry_run, join_keys, missing_values, parse_review, result_problems,
                         self_comparisons, tables_in)
+from .trace import set_question, set_step
 from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
@@ -545,6 +546,7 @@ class SQLAgent:
         independent_plans: bool = False,
         schema_ttl: float = 0.0,
         answer_shape: bool = True,
+        tracer=None,
     ):
         """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
         self.llm = llm
@@ -587,6 +589,11 @@ class SQLAgent:
         self.max_attempts = max_attempts
         self.max_rows = max_rows
         self.schema_linking = schema_linking
+        from .trace import tracer_from_env
+
+        self.tracer = tracer or tracer_from_env(_run_settings(llm, self))
+        if self.tracer is not None:  # every prompt, raw reply, token count and stop reason
+            llm = llm.with_config(callbacks=[self.tracer])
         self._link = LINK_PROMPT | llm | StrOutputParser()
         self._generate = GENERATE_PROMPT | llm | StrOutputParser()
         self._fix = FIX_PROMPT | llm | StrOutputParser()
@@ -721,10 +728,12 @@ class SQLAgent:
             return {"mapping": s["mapping"]}
         if not self.schema_linking:
             return {"mapping": ""}
+        set_step("plan", attempt=0)
         return {"mapping": self._link.invoke(self._base(s)).strip()}
 
     def _node_generate(self, s: SQLState) -> dict:
         attempts = s.get("attempts", 0) + 1
+        set_step("repair" if s.get("error") else "generate", attempt=attempts)
         if s.get("error"):
             raw = self._fix.invoke({**self._base(s), "sql": s.get("sql", ""), "error": s["error"]})
         else:
@@ -732,7 +741,10 @@ class SQLAgent:
             for q, sql in s.get("examples") or []:
                 shots += [HumanMessage(q), AIMessage(f"```sql\n{sql}\n```")]
             raw = self._generate.invoke({**self._base(s), "examples": shots})
-        return {"sql": clean_sql(raw), "attempts": attempts, "error": None}
+        sql = clean_sql(raw)
+        if self.tracer is not None:
+            self.tracer.event("sql", sql=sql, attempt=attempts)
+        return {"sql": sql, "attempts": attempts, "error": None}
 
     def _node_check(self, s: SQLState) -> dict:
         try:
@@ -795,6 +807,7 @@ class SQLAgent:
                 problem = next(((k, m) for k, m in result_problems(s["question"], sql, res.columns, res.rows)
                                 if k not in seen), None)
         if problem is None and self.review and not s.get("reviewed"):
+            set_step("review")
             reply = self._review.invoke({"question": s["question"], "sql": sql, "n_rows": len(res.rows),
                                          "table": rows_as_text(res.columns, res.rows, limit=5)})
             good, reason = parse_review(reply)
@@ -813,6 +826,8 @@ class SQLAgent:
 
     def _fail(self, s: SQLState, error: str) -> dict:
         log.info("SQL attempt %s failed: %s", s.get("attempts"), error)
+        if self.tracer is not None:
+            self.tracer.event("check", ok=False, attempt=s.get("attempts"), sql=s.get("sql", ""), error=error)
         return {"error": error, "failures": [*s.get("failures", []), (s.get("sql", ""), error)]}
 
     def _route(self, s: SQLState) -> str:
@@ -851,6 +866,7 @@ class SQLAgent:
         documents about that database) once the database is known.
         """
         candidates: list[str] = []
+        set_question(question)
         if self.catalog is not None:
             if database:
                 name = database
@@ -873,6 +889,7 @@ class SQLAgent:
         if _ASKS_FOR_ALL.search(question):
             base["hint"] = ALL_INFO_HINT
         limit = {"recursion_limit": 4 * self.max_attempts + 10}
+        set_step("", candidate=0)
         states = [_settle(self._graph.invoke(base, limit))]
         if self.sql_candidates > 1 and self.db is not None:
             shots = list(examples or [])
@@ -887,9 +904,13 @@ class SQLAgent:
                     # different example order/subset per candidate (MCS-SQL)
                     "examples": shots[i % len(shots):] + shots[: i % len(shots)] if shots else [],
                 }
+                set_step("", candidate=i)
                 states.append(_settle(self._graph.invoke(variant, limit)))
         state = vote(states)
         result = self._result(question, state, candidates, len(states))
+        if self.tracer is not None:
+            self.tracer.event("result", sql=result.sql, ok=result.ok, error=result.error, attempts=result.attempts,
+                              executed=result.executed, database=result.database, schema_shown=dict(self.last_schema))
         result.alternatives = [st.get("sql", "") for st in states if st.get("executed") and not st.get("error")]
         return result
 
@@ -948,6 +969,7 @@ class SQLAgent:
         }
 
     def summarize(self, r: SQLResult) -> str:
+        set_step("summary")
         return self._summary.invoke(self.summary_inputs(r)).strip()
 
     def stream_summary(self, r: SQLResult):
@@ -1077,6 +1099,30 @@ CANDIDATE_HINTS = (
     "Before writing, re-check which table each column belongs to and the exact filter values.",
     "Prefer a simple query: no extra columns, no extra joins, only what the question asks for.",
 )
+
+
+def _run_settings(llm, agent) -> dict:
+    """What a trace needs to reproduce a run: model, sampling, limits, agent version."""
+    import hashlib
+    import os
+
+    get = lambda *names: next((getattr(llm, n) for n in names if getattr(llm, n, None) is not None), None)  # noqa: E731
+    code = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    return {
+        "model": get("model", "model_name"),
+        "temperature": get("temperature"),
+        "seed": get("seed"),
+        "num_ctx": get("num_ctx"),
+        "num_predict": get("num_predict", "max_tokens"),
+        "agent_version": os.getenv("DOCQA_AGENT_VERSION") or f"sql.py {code}",
+        "dialect": agent.dialect,
+        "schema_chars": agent.schema_chars,
+        "max_attempts": agent.max_attempts,
+        "schema_linking": agent.schema_linking,
+        "patterns": agent._patterns is not None,
+        "answer_checks": agent.answer_checks,
+        "answer_shape": agent.answer_shape,
+    }
 
 
 def _norm_sql(sql: str) -> str:

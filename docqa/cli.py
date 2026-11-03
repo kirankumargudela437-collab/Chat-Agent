@@ -321,6 +321,15 @@ def cmd_eval(args) -> int:
     return 0
 
 
+def cmd_failures(args) -> int:
+    from .failures import main
+
+    text = main(args.run, args.out, args.holdout)
+    print(text)
+    print(f"Report: {args.out}\nReview sheet: {Path(args.out).with_suffix('.csv')}")
+    return 0
+
+
 def cmd_sample(args) -> int:
     from .sample import create_sample_workspace
 
@@ -430,6 +439,13 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--no-patterns", action="store_true", help="don't show worked examples of SQL techniques")
     ev.add_argument("--sql-candidates", type=int, help="write N queries and keep the majority result (default DOCQA_SQL_CANDIDATES=1)")
     ev.set_defaults(func=cmd_eval)
+
+    fr = sub.add_parser("failures", help="label SQL failures across runs (from results + DOCQA_TRACE_FILE traces)")
+    fr.add_argument("--run", action="append", required=True,
+                    help="name=results.jsonl[,trace.jsonl]; repeat for several runs")
+    fr.add_argument("--out", default="failure_report.md")
+    fr.add_argument("--holdout", help="a file of question ids to leave out of the diagnosis")
+    fr.set_defaults(func=cmd_failures)
 
     sa = sub.add_parser("sample", help="create sample docs, code, SQL and a SQLite database to try the agent")
     sa.add_argument("folder", nargs="?", default="sample_workspace")

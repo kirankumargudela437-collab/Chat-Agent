@@ -409,6 +409,17 @@ the dialect (Oracle `FETCH FIRST 1 ROWS ONLY`, SQL Server `TOP 1`), Oracle queri
 with an empty wrapped query (`WHERE 1 = 0`) before they run, and `DOCQA_SCHEMA_TTL` re-reads a
 changing schema during a chat.
 
+**Tracing and failure labels.** `DOCQA_TRACE_FILE=trace.jsonl` appends every SQL model call:
+the run settings once (model, temperature, seed, context window, output limit, agent version),
+then per call the step (plan / generate / repair / review), the exact messages, the raw reply
+before SQL extraction, token counts, stop reason, seconds and a repetition score, plus the SQL
+extracted and each check's verdict. `docqa failures --run r1=results.jsonl,trace.jsonl --run
+r2=... --holdout holdout.txt --out report.md` labels every failure (loop, cut off, invalid SQL,
+missing schema, wrong join / aggregation / filter / columns, unclear), counts labels per run,
+shows which questions are always wrong versus flaky, and writes a CSV with a `reviewed_labels`
+column for the manual pass. `DOCQA_TEMPERATURE`, `DOCQA_SEED` and `DOCQA_NUM_PREDICT` control
+sampling and the output cap.
+
 For a fair comparison, freeze question sets: `--save-ids` writes the chosen ids, `--ids` runs
 exactly those, and `--exclude-ids` keeps the regression questions out of an unseen set:
 `docqa eval bird --exclude-ids regression30.txt --limit 60 --seed 1 --save-ids unseen60.txt`.

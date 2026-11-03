@@ -714,3 +714,57 @@ def test_answer_shape_can_be_switched_off_to_isolate_the_schema_fix():
     assert "Answer shape" not in LINK_PROMPT.format_messages(**base)[0].content
     agent.answer_shape = True
     assert "Answer shape" in LINK_PROMPT.format_messages(**agent._base({"schema": "", "question": "q"}))[0].content
+
+
+# --------------------------------------------------------------------------- tracing + failure report
+
+
+def test_trace_records_every_call_with_prompt_raw_reply_and_steps(tmp_path):
+    from docqa.trace import CallTracer, repetition
+
+    trace = tmp_path / "t.jsonl"
+    tracer = CallTracer(trace, {"model": "fake", "temperature": 0})
+    llm = FakeListChatModel(responses=["the plan", "```sql\nSELECT 1\n```"])
+    agent = SQLAgent(llm, schema_linking=True, sql_patterns=False, tracer=tracer, dialect="sqlite")
+    agent.run("How many orders?", schema="CREATE TABLE orders (id INTEGER);")
+    recs = [json.loads(x) for x in trace.read_text().splitlines()]
+    assert recs[0]["type"] == "run" and recs[0]["model"] == "fake"
+    calls = [r for r in recs if r["type"] == "call"]
+    assert [c["step"] for c in calls] == ["plan", "generate"]
+    assert all(c["question"] == "How many orders?" and c["messages"] and "raw" in c for c in calls)
+    assert "CREATE TABLE orders" in calls[1]["messages"][0]["content"]
+    assert calls[1]["raw"].startswith("```sql")
+    assert any(r["type"] == "sql" and r["sql"] == "SELECT 1" for r in recs)
+    assert any(r["type"] == "result" for r in recs)
+    assert repetition("SELECT a FROM t; " * 60) > 0.8 and repetition("one two three four five six seven " * 1) == 0
+
+
+def test_failure_report_labels_and_patterns_across_runs(tmp_path):
+    from docqa.failures import main
+
+    gold = "SELECT o.id FROM orders o LEFT JOIN payments p ON p.order_id = o.id WHERE p.id IS NULL"
+    rows1 = [
+        {"id": "1", "question": "unpaid orders", "gold_sql": gold, "pred_sql":
+         "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id WHERE p.amount = 0", "correct": False,
+         "difficulty": "challenging"},
+        {"id": "2", "question": "count orders", "gold_sql": "SELECT COUNT(*) FROM orders",
+         "pred_sql": "SELECT COUNT(*) FROM orders", "correct": True, "difficulty": "simple"},
+        {"id": "5", "question": "held out", "gold_sql": "SELECT 1", "pred_sql": "", "correct": False},
+    ]
+    rows2 = [dict(rows1[0]), dict(rows1[1], correct=False, pred_sql="SELECT SUM(id) FROM orders")]
+    r1, r2, t1 = tmp_path / "r1.jsonl", tmp_path / "r2.jsonl", tmp_path / "t1.jsonl"
+    r1.write_text("\n".join(json.dumps(r) for r in rows1))
+    r2.write_text("\n".join(json.dumps(r) for r in rows2))
+    t1.write_text("\n".join(json.dumps(r) for r in [
+        {"type": "run", "model": "qwen2.5-coder:7b", "temperature": 0},
+        {"type": "call", "step": "generate", "question": "unpaid orders", "raw": "x", "output_chars": 3000,
+         "repetition": 0.9, "stop_reason": "length", "messages": [{"role": "system", "content": "CREATE TABLE orders"}]},
+    ]))
+    (tmp_path / "hold.txt").write_text("5\n")
+    text = main([f"a={r1},{t1}", f"b={r2}"], str(tmp_path / "rep.md"), str(tmp_path / "hold.txt"))
+    assert "loop" in text and "missing_schema" in text  # payments was never in that prompt
+    assert "wrong_join" in text and "wrong_filter" in text
+    assert "wrong_aggregation" in text  # run b, question 2
+    assert "Always right 0, flaky 1, always wrong 1" in text
+    assert "| 5 |" not in text  # held-out question left out
+    assert (tmp_path / "rep.csv").read_text().count("\n") == 5

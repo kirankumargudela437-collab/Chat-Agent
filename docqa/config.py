@@ -52,6 +52,8 @@ class Settings:
     use_docling: bool = False
     temperature: float = 0.0
     num_ctx: int = 8192
+    seed: int | None = None           # Ollama sampling seed (DOCQA_SEED), for repeatable runs
+    num_predict: int | None = None    # cap on output tokens per call (DOCQA_NUM_PREDICT); a loop then stops as "length"
     # code and SQL
     include_code: bool = True
     code_chunk_size: int = 1500
@@ -129,6 +131,9 @@ class Settings:
             top_k=int(_env("DOCQA_TOP_K", "4")),
             use_docling=_flag("DOCQA_USE_DOCLING", "0"),
             num_ctx=int(_env("DOCQA_NUM_CTX", "8192")),
+            temperature=float(_env("DOCQA_TEMPERATURE", "0")),
+            seed=int(os.environ["DOCQA_SEED"]) if os.getenv("DOCQA_SEED") else None,
+            num_predict=int(os.environ["DOCQA_NUM_PREDICT"]) if os.getenv("DOCQA_NUM_PREDICT") else None,
             include_code=_flag("DOCQA_INCLUDE_CODE", "1"),
             code_chunk_size=int(_env("DOCQA_CODE_CHUNK_SIZE", "1500")),
             code_chunk_overlap=int(_env("DOCQA_CODE_CHUNK_OVERLAP", "150")),
