@@ -3,6 +3,7 @@ id: negation
 cues: not, never, no, without, none, did not, have not, haven't, didn't, except, other than, excluding, not in, missing from, has no, with no, no students, any, not have, do not, does not, never been
 use: Find rows with no matching row elsewhere using NOT EXISTS, NOT IN (on a column without NULLs), EXCEPT, or LEFT JOIN ... WHERE right.key IS NULL.
 avoid: Using != on a join ("customers whose order is not X" still returns customers who also have an X order); NOT IN over a subquery that can return NULL (returns nothing).
+manual: NOT EXISTS NOT IN EXCEPT subquery expressions anti join
 
 ## Example
 Q: Which customers have never placed an order?

@@ -3,6 +3,7 @@ id: window-aggregate
 cues: running total, cumulative, so far, to date, moving average, rolling, share of, percent of total, compared with the group average, each row with the total
 use: SUM/AVG/COUNT(...) OVER (...) adds a group or running value to every row without collapsing rows. ORDER BY inside OVER makes it cumulative.
 avoid: GROUP BY when each row must stay; forgetting ORDER BY in OVER for running totals.
+manual: window functions aggregate OVER PARTITION BY ORDER BY frame ROWS BETWEEN PRECEDING running sum
 
 ## Example
 Q: Running total of order revenue by date.

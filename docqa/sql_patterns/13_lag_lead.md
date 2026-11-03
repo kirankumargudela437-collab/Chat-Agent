@@ -3,6 +3,7 @@ id: lag-lead
 cues: previous, prior, last month, change, growth, increase, decrease, difference from, compared to the previous, month over month, next, gap between, days since
 use: LAG(col) OVER (ORDER BY ...) reads the previous row's value and LEAD the next one; subtract to get the change.
 avoid: Self-joining on date minus one (breaks on gaps); forgetting PARTITION BY when the comparison is per customer or per product.
+manual: window functions LAG LEAD previous next row
 
 ## Example
 Q: Monthly revenue and the change from the previous month.

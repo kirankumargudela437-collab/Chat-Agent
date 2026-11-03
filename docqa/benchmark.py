@@ -393,6 +393,7 @@ def evaluate(
     done: dict[str, dict] | None = None,
     bank: "ExampleBank | None" = None,
     shots: int = 4,
+    docs: "DocsContext | None" = None,
 ) -> Iterator[Outcome]:
     """Ask ``agent`` (a ``SQLAgent`` with a catalog) every question; yield one ``Outcome`` each."""
     done = done or {}
@@ -414,7 +415,8 @@ def evaluate(
         question = with_evidence(ex.question, ex.evidence)
         try:
             shown = bank.similar(ex.question, shots, exclude_db=ex.db_id) if bank and shots else None
-            r = agent.run(question, context="", database=ex.db_id if oracle_db else None, examples=shown)
+            r = agent.run(question, context="", database=ex.db_id if oracle_db else None, examples=shown,
+                          context_fn=docs.for_database if docs else None)
             out.pred_sql, out.attempts, out.routed_db, out.candidates = r.sql, r.attempts, r.database, r.candidates
             if r.error:
                 out.error = r.error
@@ -425,6 +427,64 @@ def evaluate(
             out.error = f"{type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}"
         out.seconds = round(time.monotonic() - start, 2)
         yield out
+
+
+class DocsContext:
+    """Passages from a documents folder for each benchmark question, as the app would give.
+
+    The folder holds one sub-folder per database (``<docs>/<db_id>/...``: a data dictionary,
+    business rules, in any format the app reads) and, optionally, general SQL reference
+    material in other folders. It is indexed once with the app's own sync (incremental, so
+    a re-run re-embeds nothing). For a question, once the agent has picked its database,
+    the passages come from that database's folder only (hybrid vector + keyword search),
+    plus one reference page per SQL technique the question needs.
+    """
+
+    def __init__(self, settings, docs_dir: Path, top_k: int = 4, patterns=None, embeddings=None):
+        import dataclasses
+
+        from langchain_core.documents import Document
+
+        from .indexing import open_vectorstore, sync_documents
+        from .keyword import KeywordIndex
+
+        s = dataclasses.replace(settings, docs_dir=Path(docs_dir), data_dir=Path(settings.data_dir) / "eval-docs")
+        self.store = open_vectorstore(s, embeddings)
+        self.sync = sync_documents(s, vectorstore=self.store)
+        got = self.store.get(include=["documents", "metadatas"])
+        by_folder: dict[str, list] = {}
+        for text, meta in zip(got["documents"], got["metadatas"]):
+            meta = meta or {}
+            folder = str(meta.get("source", "")).replace("\\", "/").split("/", 1)[0]
+            by_folder.setdefault(folder, []).append(Document(page_content=text, metadata=meta))
+        self.docs_by_folder = by_folder
+        self._keyword = {f: KeywordIndex(d) for f, d in by_folder.items()}
+        self.top_k = top_k
+        self.patterns = patterns
+        self.reference_folders: list[str] = []  # set by the caller: folders that are not databases
+
+    def _search(self, query: str, folders: list[str], k: int) -> list:
+        from .keyword import reciprocal_rank_fusion
+
+        sources = sorted({d.metadata.get("source") for f in folders for d in self.docs_by_folder.get(f, [])})
+        if not sources:
+            return []
+        vector = self.store.similarity_search(query, k=2 * k, filter={"source": {"$in": sources}})
+        keyword = [d for f in folders for d in self._keyword[f].search(query, 2 * k)]
+        return reciprocal_rank_fusion([vector, keyword], k)
+
+    def for_database(self, database: str, question: str) -> str:
+        from .chain import citation_label
+
+        found = self._search(question, [database], self.top_k)
+        if self.patterns is not None and self.reference_folders:
+            for p in self.patterns.search(question):
+                found += self._search(p.manual, self.reference_folders, 1)
+        if not found:
+            return ""
+        return "Passages from the documents:\n\n" + "\n\n".join(
+            f"[{i}] (source: {citation_label(d)})\n{d.page_content}" for i, d in enumerate(found, 1)
+        )
 
 
 def with_evidence(question: str, evidence: str) -> str:

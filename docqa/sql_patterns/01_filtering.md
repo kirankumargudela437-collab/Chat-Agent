@@ -3,6 +3,7 @@ id: filtering
 cues: equal to, more than, less than, greater than, at least, at most, between, either, or, located in, and also, with status
 use: Keep only the rows that meet conditions. Combine conditions with AND / OR, and put parentheses around every OR group that sits next to an AND.
 avoid: Mixing AND and OR without parentheses; adding conditions the question did not ask for; using = with a value spelled differently from the stored one.
+manual: WHERE clause boolean operators AND OR operator precedence IN BETWEEN comparison operators
 
 ## Example
 Q: Which customers are in London?

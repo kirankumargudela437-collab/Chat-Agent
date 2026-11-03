@@ -3,6 +3,7 @@ id: joins
 cues: with their, along with, and their, together with, who bought, belongs to, sold by, related, linked, joined, through, bridge, many to many
 use: JOIN tables on their key columns (a foreign key to the primary key it references). For many-to-many links, go through the bridge table that holds both keys.
 avoid: Joining on columns that only share a name but mean different things; skipping the bridge table and joining two tables that have no direct key; joining tables the question does not need.
+manual: JOIN ON inner join join clause foreign key table expressions
 
 ## Example
 Q: Show each order with the name of its customer.

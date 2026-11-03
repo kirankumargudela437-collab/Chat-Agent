@@ -3,6 +3,7 @@ id: left-join
 cues: including those with none, even if, all customers, every, zero, 0, no orders, with or without, including, count of each including
 use: LEFT JOIN keeps every row of the left table, with NULLs where the right side has no match. Use it when rows with no match must still appear (for example with a count of 0).
 avoid: Putting a condition on the right table in WHERE (turns the LEFT JOIN back into an inner join; move it into ON); COUNT(*) instead of COUNT(right.key) (counts 1 for no match).
+manual: LEFT OUTER JOIN outer join null rows ON versus WHERE
 
 ## Example
 Q: How many orders does every customer have, including customers with none?

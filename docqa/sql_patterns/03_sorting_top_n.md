@@ -3,6 +3,7 @@ id: top-n
 cues: top, first, highest, lowest, most, least, largest, smallest, best, worst, latest, earliest, most recent, oldest, newest, order by, sorted, rank, youngest, oldest, top 3, top 5, fewest
 use: ORDER BY the measure (DESC for highest / latest / most, ASC for lowest / earliest / least) and LIMIT to the number asked for.
 avoid: Sorting the wrong direction ("most recent" is DESC on the date; "youngest" is DESC on birth date); returning all rows when the question asks for one; forgetting LIMIT.
+manual: ORDER BY DESC ASC LIMIT OFFSET sorting
 
 ## Example
 Q: What are the three most expensive products?

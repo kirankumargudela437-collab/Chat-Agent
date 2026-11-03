@@ -3,6 +3,7 @@ id: percentage
 cues: percent, percentage, %, ratio, rate, proportion, share, fraction, how much of, out of, conversion, per cent
 use: Percentage = 100.0 * part / whole. Use 100.0 (or CAST ... AS REAL) so integer division does not round to 0, and NULLIF(whole, 0) against division by zero. Count the part with SUM(CASE ...) over the same rows as the whole.
 avoid: Integer division (1 / 4 = 0 in SQLite and Postgres); a denominator that counts different rows from the numerator; reading "ratio of A to B" upside down (it is A / B).
+manual: integer division CAST real numeric division NULLIF arithmetic operators
 
 ## Example
 Q: What percentage of orders were cancelled?

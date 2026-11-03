@@ -3,6 +3,7 @@ id: set-ops
 cues: both, either, and also, as well as, in both, in either, combined list, but not, only in, appear in both, union, intersect
 use: UNION merges two lists (removing duplicates; UNION ALL keeps them), INTERSECT keeps values in both, EXCEPT keeps values in the first but not the second. Both sides need the same number of columns.
 avoid: AND on one row when the question means "in both lists" (one row cannot be two things at once); different column counts on the two sides.
+manual: compound select UNION UNION ALL INTERSECT EXCEPT set operations
 
 ## Example
 Q: Cities where we have customers or employees.

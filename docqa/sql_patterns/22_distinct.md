@@ -3,6 +3,7 @@ id: distinct
 cues: different, distinct, unique, list of all, which cities, duplicates, repeated, more than once, appear twice, without repeats
 use: SELECT DISTINCT returns each combination once. Find duplicates with GROUP BY ... HAVING COUNT(*) > 1.
 avoid: DISTINCT to hide a wrong join that multiplies rows; DISTINCT on a column list that includes a unique id (does nothing).
+manual: SELECT DISTINCT duplicate rows
 
 ## Example
 Q: Which countries do our customers come from?

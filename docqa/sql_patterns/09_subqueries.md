@@ -3,6 +3,7 @@ id: subquery
 cues: than the average, above average, more than average, compared to, same as, in the list of, whose, that have, maximum of, greater than all, at least one
 use: A scalar subquery returns one value to compare with; IN (subquery) tests membership; a correlated subquery runs per outer row.
 avoid: A subquery that returns several rows where one value is expected; a correlated subquery when a JOIN or GROUP BY is simpler.
+manual: subquery scalar subquery correlated subquery IN ANY ALL EXISTS
 
 ## Example
 Q: Which products cost more than the average product price?

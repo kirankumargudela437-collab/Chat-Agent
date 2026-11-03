@@ -3,6 +3,7 @@ id: group-by
 cues: each, per, for every, by, breakdown, group, grouped, in each, for each, at least, more than, having
 use: GROUP BY the column(s) that define a group; aggregate the rest. Filter groups with HAVING, rows with WHERE.
 avoid: Grouping by a name when names can repeat (group by the id, show the name); putting an aggregate in WHERE; selecting columns that are neither grouped nor aggregated.
+manual: GROUP BY HAVING clause aggregate grouping
 
 ## Example
 Q: How many orders does each customer have?

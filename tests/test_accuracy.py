@@ -434,3 +434,36 @@ def test_own_pattern_files_are_added(tmp_path):
     llm = RecordingLLM(responses=["SELECT 1"], prompts=[])
     SQLAgent(llm, db, schema_linking=False, value_lookup=False, patterns_dir=str(tmp_path)).run("Revenue in fiscal 2024?")
     assert "Our fiscal year starts in April." in llm.prompts[0][0].content
+
+
+def test_pattern_examples_follow_the_database_dialect(tmp_path):
+    from docqa.sqlpatterns import PatternIndex, format_patterns
+
+    found = PatternIndex().search("What are the three most expensive products?")
+    oracle = format_patterns(found, dialect="oracle")
+    assert "FETCH FIRST 3 ROWS ONLY" in oracle and "LIMIT 3" not in oracle
+    assert "TOP 3" in format_patterns(found, dialect="tsql")
+    assert "LIMIT 3" in format_patterns(found)  # SQLite as written
+
+
+def test_eval_docs_context_comes_from_the_routed_database_folder(tmp_path, embeddings):
+    from conftest import make_docx, make_pdf
+    from docqa.config import Settings
+    from docqa.sqlpatterns import PatternIndex
+
+    docs = tmp_path / "docs"
+    (docs / "european_football").mkdir(parents=True)
+    (docs / "card_games").mkdir()
+    (docs / "sql_manual").mkdir()
+    make_pdf(docs / "european_football" / "Country.pdf", ["Country.name: full country name, e.g. Slovakia; code SVK."])
+    make_docx(docs / "card_games" / "cards.docx", ["cards.rarity: common, uncommon, rare or mythic."])
+    (docs / "sql_manual" / "window.md").write_text(
+        "# Window functions\n\nROW_NUMBER() OVER (PARTITION BY ...) numbers rows within each partition.\n", encoding="utf-8")
+    s = Settings(docs_dir=docs, data_dir=tmp_path / "data", chunk_size=200, chunk_overlap=40)
+    ctx = bm.DocsContext(s, docs, top_k=3, patterns=PatternIndex(), embeddings=embeddings)
+    ctx.reference_folders = ["sql_manual"]
+    text = ctx.for_database("european_football", "Which country has the most matches? Rank the top 2 in each league")
+    assert "Slovakia" in text and "Country.pdf" in text
+    assert "rarity" not in text  # another database's documents never leak in
+    assert "ROW_NUMBER" in text  # the reference page for the ranking technique
+    assert ctx.for_database("unknown_db", "anything") == "" or "rarity" not in ctx.for_database("unknown_db", "x")

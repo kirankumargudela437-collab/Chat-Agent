@@ -3,6 +3,7 @@ id: aggregation
 cues: how many, number of, count, total, sum, average, mean, maximum, minimum, overall, in total, distinct, different
 use: COUNT, SUM, AVG, MIN, MAX collapse rows into one value. COUNT(DISTINCT col) counts different values.
 avoid: Counting rows after a join that duplicates them (count DISTINCT the key instead); averaging an average; returning extra columns next to an aggregate without GROUP BY.
+manual: aggregate functions count sum avg min max count distinct
 
 ## Example
 Q: How many customers are there?

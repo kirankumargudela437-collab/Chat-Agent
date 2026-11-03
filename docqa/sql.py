@@ -284,6 +284,21 @@ class QueryResult:
     truncated: bool
 
 
+def _server_timeout(conn, seconds: float) -> None:
+    """The same time limit on server databases: Postgres statement_timeout, MySQL
+    max_execution_time, Oracle's driver call_timeout. SQLite uses the progress handler."""
+    name = conn.dialect.name
+    try:
+        if name == "postgresql":
+            conn.exec_driver_sql(f"SET LOCAL statement_timeout = {int(seconds * 1000)}")
+        elif name in ("mysql", "mariadb"):
+            conn.exec_driver_sql(f"SET SESSION max_execution_time = {int(seconds * 1000)}")
+        elif name == "oracle":
+            conn.connection.driver_connection.call_timeout = int(seconds * 1000)
+    except Exception as e:  # never block a query over the limit itself
+        log.debug("Could not set a query time limit on %s: %s", name, e)
+
+
 QUERY_TIMEOUT = 30.0  # seconds; a runaway join on a big SQLite file would otherwise hang the agent
 
 
@@ -298,13 +313,16 @@ def run_query(db, sql: str, max_rows: int, timeout: float | None = QUERY_TIMEOUT
     with db._engine.connect() as conn:
         if timeout:
             _guard(conn, time.monotonic() + timeout)
+            _server_timeout(conn, timeout)
         try:
             # no_parameters: '%' and ':name' inside the SQL are passed to the driver untouched
             res = conn.execution_options(no_parameters=True).exec_driver_sql(sql)
             columns = list(res.keys()) if res.returns_rows else []
             rows = [tuple(r) for r in res.fetchmany(max_rows + 1)] if res.returns_rows else []
         except Exception as e:
-            if timeout and "interrupted" in str(e).lower():
+            msg = str(e).lower()
+            if timeout and any(m in msg for m in ("interrupted", "statement timeout", "dpi-1067", "call timeout",
+                                                  "max_execution_time", "query execution was interrupted")):
                 raise TimeoutError(
                     f"query ran longer than {timeout:g}s and was stopped; write a simpler query "
                     "(filter early, join on keys, avoid cross joins and correlated subqueries)"
@@ -713,10 +731,13 @@ class SQLAgent:
         schema: str = "",
         examples: list[tuple[str, str]] | None = None,
         database: str | None = None,
+        context_fn=None,
     ) -> SQLResult:
         """``examples`` are golden (question, sql) pairs, shown to the generator as earlier turns.
 
         With a catalog, ``database`` names the database to use; otherwise it is routed.
+        ``context_fn(database_name, question)`` returns extra context (passages from the
+        documents about that database) once the database is known.
         """
         candidates: list[str] = []
         if self.catalog is not None:
@@ -725,6 +746,9 @@ class SQLAgent:
             else:
                 name, candidates = self.route(question)
             self.use_database(name)
+        if context_fn is not None:
+            extra = context_fn(self.database_name, question)
+            context = f"{context}\n\n{extra}".strip() if extra else context
         context = self._with_value_hints(question, context)
         context = self._with_patterns(question, context)
         base = {
@@ -759,7 +783,7 @@ class SQLAgent:
             return context
         from .sqlpatterns import format_patterns
 
-        text = format_patterns(self._patterns.search(question))
+        text = format_patterns(self._patterns.search(question), dialect=self.dialect)
         if not text:
             return context
         return f"{context}\n\n{text}" if context else text

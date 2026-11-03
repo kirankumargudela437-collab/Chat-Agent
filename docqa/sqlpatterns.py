@@ -38,14 +38,29 @@ class Pattern:
     cues: list[str]
     use: str
     avoid: str
+    manual: str = ""  # words to search SQL reference documents with (manual pages, cheat sheets)
     examples: list[Example] = field(default_factory=list)
 
-    def text(self, max_examples: int = 2) -> str:
-        """The pattern as the model sees it: the rule, the usual mistake and a few examples."""
+    def text(self, max_examples: int = 2, dialect: str = "sqlite") -> str:
+        """The pattern as the model sees it: the rule, the usual mistake and a few examples,
+        the SQL translated into ``dialect`` (written once, in SQLite, shown in any dialect)."""
         lines = [f"### {self.title}", f"Use: {self.use}", f"Avoid: {self.avoid}"]
         for ex in self.examples[:max_examples]:
-            lines.append(f"Q: {ex.question}\n{ex.sql}" + (f"\n-- {ex.why}" if ex.why else ""))
+            lines.append(f"Q: {ex.question}\n{translate(ex.sql, dialect)}" + (f"\n-- {ex.why}" if ex.why else ""))
         return "\n".join(lines)
+
+
+def translate(sql: str, dialect: str) -> str:
+    """``sql`` (SQLite) in another dialect: LIMIT -> FETCH FIRST / TOP, strftime -> TO_CHAR, ...
+    Falls back to the original when sqlglot cannot translate it."""
+    if not dialect or dialect == "sqlite":
+        return sql
+    try:
+        import sqlglot
+
+        return ";\n".join(sqlglot.transpile(sql, read="sqlite", write=dialect)) + ";"
+    except Exception:
+        return sql
 
 
 def parse_pattern(text: str) -> Pattern:
@@ -68,6 +83,7 @@ def parse_pattern(text: str) -> Pattern:
         cues=[c.strip().lower() for c in field_("cues").split(",") if c.strip()],
         use=field_("use"),
         avoid=field_("avoid"),
+        manual=field_("manual") or title,
         examples=examples,
     )
 
@@ -110,11 +126,11 @@ class PatternIndex:
         return [self.patterns[i] for i in ranked[:k] if scores[i] >= min_score]
 
 
-def format_patterns(patterns: list[Pattern], max_examples: int = 2) -> str:
+def format_patterns(patterns: list[Pattern], max_examples: int = 2, dialect: str = "sqlite") -> str:
     if not patterns:
         return ""
     return (
         "SQL techniques that fit this question. The examples use a demo shop schema: copy the "
         "technique, never its table or column names; use only the schema above.\n\n"
-        + "\n\n".join(p.text(max_examples) for p in patterns)
+        + "\n\n".join(p.text(max_examples, dialect) for p in patterns)
     )

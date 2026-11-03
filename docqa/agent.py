@@ -212,7 +212,23 @@ class Agent:
                 if key not in seen:
                     seen.add(key)
                     docs.append(d)
+        # SQL reference documents (a manual, a cheat sheet) share no words with a business
+        # question, so they are searched by the techniques the question needs instead.
+        for d in self._manual_pages(question):
+            key = doc_key(d)
+            if key not in seen:
+                seen.add(key)
+                docs.append(d)
         return docs
+
+    def _manual_pages(self, question: str, per_pattern: int = 1) -> list[Document]:
+        patterns = getattr(self.sql_agent, "_patterns", None)
+        if patterns is None or "doc" not in self.categories:
+            return []
+        found: list[Document] = []
+        for p in patterns.search(question):
+            found += self._find(p.manual, "doc", per_pattern)
+        return found
 
     def run_sql(self, sql: str) -> SQLResult:
         """Run the user's own SQL (``/run SELECT ...``) through the same read-only checks."""

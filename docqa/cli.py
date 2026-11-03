@@ -267,7 +267,16 @@ def cmd_eval(args) -> int:
                 print(f"No training questions found for --shots (looked for {', '.join(TRAIN_FILES[args.name])}); running zero-shot.")
             else:
                 print(f"Few-shot: {args.shots} similar solved questions per question from {len(bank)} training examples")
-        outcomes = evaluate(agent, split, examples, args.oracle_db, args.timeout, done, bank, args.shots)
+        docs = None
+        if args.docs:
+            from .benchmark import DocsContext
+
+            docs = DocsContext(s, Path(args.docs), top_k=s.top_k, patterns=agent._patterns)
+            docs.reference_folders = [f for f in docs.docs_by_folder if f not in catalog.paths]
+            print(f"Documents: {args.docs}: {docs.sync.summary().splitlines()[0]}; "
+                  f"{len(docs.docs_by_folder) - len(docs.reference_folders)} database folders, "
+                  f"reference folders: {', '.join(docs.reference_folders) or 'none'}")
+        outcomes = evaluate(agent, split, examples, args.oracle_db, args.timeout, done, bank, args.shots, docs)
     out.parent.mkdir(parents=True, exist_ok=True)
     results = []
     with open(out, "a" if args.resume else "w", encoding="utf-8") as fh:
@@ -284,7 +293,7 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
@@ -382,6 +391,8 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--shots", type=int, default=0, help="show N similar solved training questions per question (DAIL-SQL style)")
     ev.add_argument("--train", help="folder with the training questions for --shots (default: next to dev.json)")
     ev.add_argument("--no-values", action="store_true", help="don't look up matching database values")
+    ev.add_argument("--docs", help="a documents folder (one sub-folder per database, e.g. a data dictionary); "
+                    "each question gets passages from its database's folder, as in the app")
     ev.add_argument("--no-patterns", action="store_true", help="don't show worked examples of SQL techniques")
     ev.add_argument("--sql-candidates", type=int, help="write N queries and keep the majority result (default DOCQA_SQL_CANDIDATES=1)")
     ev.set_defaults(func=cmd_eval)

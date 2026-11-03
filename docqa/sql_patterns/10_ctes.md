@@ -3,6 +3,7 @@ id: cte
 cues: step by step, then, among them, of those, based on that, intermediate result, average of the totals, average per, total per then, first compute
 use: WITH name AS (...) gives a sub-result a name, so a complex question becomes readable steps: compute per-group values first, then filter, rank or aggregate them.
 avoid: Nesting many subqueries instead; averaging rows when the question wants the average of per-group totals.
+manual: WITH clause common table expressions CTE
 
 ## Example
 Q: What is the average revenue per customer?

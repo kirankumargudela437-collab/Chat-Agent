@@ -3,6 +3,7 @@ id: recursive
 cues: all levels, hierarchy, tree, under, below, descendants, ancestors, chain of command, indirect, subcategories, everyone who reports to, path
 use: WITH RECURSIVE starts from the top rows and repeatedly joins the next level, to walk a parent/child hierarchy of any depth.
 avoid: A fixed number of self-joins (misses deeper levels); a recursion without a stopping join (loops).
+manual: WITH RECURSIVE recursive common table expressions hierarchical query
 
 ## Example
 Q: Everyone who reports to Asha, directly or indirectly.

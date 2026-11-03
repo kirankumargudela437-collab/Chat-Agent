@@ -3,6 +3,7 @@ id: argmax
 cues: the one with the highest, the most, the largest, the cheapest, the most expensive, that has the maximum, with the fewest, the biggest, the top, has the most, with the highest, with the lowest
 use: When the question wants the NAME (or other details) of the row with the extreme value, ORDER BY the value LIMIT 1, or compare to MAX/MIN in a subquery when ties must all be returned. For "the group with the most X", aggregate first and then pick.
 avoid: SELECT name, MAX(x) without GROUP BY (returns an arbitrary name in SQLite, an error elsewhere); returning the value when the question asks for the name.
+manual: ORDER BY LIMIT max min subquery
 
 ## Example
 Q: Which product is the cheapest?

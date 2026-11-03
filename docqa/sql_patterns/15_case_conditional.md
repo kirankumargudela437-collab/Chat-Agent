@@ -3,6 +3,7 @@ id: case
 cues: if, when, classify, label, category, bucket, as high or low, pivot, separate columns, count of each status, how many shipped and how many cancelled, flag
 use: CASE WHEN ... THEN ... ELSE ... END builds a value from conditions. Inside SUM or COUNT it counts rows per condition, which turns rows into columns (a pivot).
 avoid: Running one query per category when one CASE pivot answers all; forgetting ELSE (gives NULL).
+manual: CASE WHEN THEN ELSE END conditional expressions
 
 ## Example
 Q: Label each product as cheap (under 50), mid (50 to 500) or expensive.

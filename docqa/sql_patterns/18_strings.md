@@ -3,6 +3,7 @@ id: strings
 cues: contains, containing, starts with, start with, ends with, end with, like, includes the word, case insensitive, first letter, length, characters, concatenate, combined with, full name, domain, substring, letter
 use: LIKE with % (any text) and _ (one character) for patterns; LOWER() for case-insensitive matching; || to join text (CONCAT in MySQL); LENGTH and SUBSTR to cut text.
 avoid: = when the question says "contains"; LIKE when an exact value is known (slower, can over-match); assuming the stored case and spacing (check the values).
+manual: string functions LIKE pattern matching lower substr instr length concatenation ||
 
 ## Example
 Q: Products whose name contains "Cable".

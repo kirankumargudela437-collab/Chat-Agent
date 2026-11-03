@@ -3,6 +3,7 @@ id: nulls
 cues: missing, without, no email, unknown, not provided, empty, null, blank, has no, default to, treat as zero
 use: NULL means "unknown". Test it with IS NULL / IS NOT NULL, replace it with COALESCE, and avoid division by zero with NULLIF.
 avoid: Writing = NULL or <> NULL (always unknown, returns nothing); forgetting that COUNT(column) skips NULLs while COUNT(*) does not.
+manual: NULL IS NULL IS NOT NULL COALESCE NULLIF null handling
 
 ## Example
 Q: Which customers have no email address?

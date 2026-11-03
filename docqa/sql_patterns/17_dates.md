@@ -1,8 +1,9 @@
 # Dates and times
 id: dates
 cues: year, month, day, date, when, since, before, after, between, last, during, in 2024, per month, monthly, weekly, age, how long, days, years, recent, quarter, youngest, oldest, born, birthday
-use: Filter with date ranges; group by a truncated date; compute differences. SQLite: strftime('%Y', d), strftime('%Y-%m', d), julianday(a) - julianday(b). Postgres: EXTRACT(YEAR FROM d), date_trunc('month', d), a - b. MySQL: YEAR(d), DATE_FORMAT(d, '%Y-%m'), DATEDIFF(a, b).
+use: Filter with date ranges; group by a truncated date; compute differences. SQLite: strftime('%Y', d), strftime('%Y-%m', d), julianday(a) - julianday(b). Postgres: EXTRACT(YEAR FROM d), date_trunc('month', d), a - b. MySQL: YEAR(d), DATE_FORMAT(d, '%Y-%m'), DATEDIFF(a, b). Oracle: EXTRACT(YEAR FROM d), TO_CHAR(d, 'YYYY-MM'), TRUNC(d, 'MM'), a - b in days. SQL Server: YEAR(d), FORMAT(d, 'yyyy-MM'), DATEDIFF(day, b, a).
 avoid: Comparing a date column to a bare year number; using the wrong dialect's functions; "youngest" means the latest birth date (MAX), not the smallest.
+manual: date and time functions strftime date julianday extract date_trunc interval
 
 ## Example
 Q: How many orders were placed in 2024?

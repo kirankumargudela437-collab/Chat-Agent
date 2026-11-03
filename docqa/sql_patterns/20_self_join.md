@@ -3,6 +3,7 @@ id: self-join
 cues: manager, reports to, boss, parent, same, pairs, two different, both in the same, colleague, another, each other, compared with other rows of the same table
 use: Join a table to itself with two aliases when a row refers to another row of the same table (employee to manager) or when comparing pairs of rows.
 avoid: Forgetting the second alias; pairs counted twice (use a.id < b.id).
+manual: table aliases self join
 
 ## Example
 Q: List each employee with their manager's name.

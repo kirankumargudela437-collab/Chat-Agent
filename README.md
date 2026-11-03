@@ -362,6 +362,15 @@ Add your own techniques or house rules as more `.md` files in the same format in
 your choice and set `DOCQA_SQL_PATTERNS_DIR`. Turn the library off with `DOCQA_SQL_PATTERNS=0`
 (`docqa eval ... --no-patterns` to measure it).
 
+**Documents in the SQL eval.** Until now the benchmark passed no documents to the SQL agent.
+`docqa eval bird --docs <folder>` indexes a folder with the app's normal sync (PDF, DOCX, CSV, MD...)
+and gives each question the passages from `<folder>/<database>/` once the agent has picked the
+database (a data dictionary, business rules), plus one page per SQL technique from any other
+folder (a SQL manual), searched by the technique's `manual:` words because a business question
+shares no words with a manual. Pattern examples are now translated into the connected database's
+dialect with sqlglot (Oracle `FETCH FIRST n ROWS ONLY`, SQL Server `TOP n`, ...), and the 30 s query
+limit also applies on Postgres, MySQL and Oracle.
+
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
 tells you to download in a browser and pass `--zip`. The schema indexer built `PRAGMA table_info('{t}')`

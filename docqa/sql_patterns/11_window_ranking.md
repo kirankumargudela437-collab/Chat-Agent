@@ -3,6 +3,7 @@ id: window-rank
 cues: rank, ranking, top per, best in each, highest in each, top 2 in every, first per, nth, second highest, position, latest per, most recent for each, second, third, top ... each, top ... per, top ... every, highest ... each, highest ... per, latest ... each, best ... each, most ... each, lowest ... each
 use: ROW_NUMBER() / RANK() / DENSE_RANK() OVER (PARTITION BY group ORDER BY measure) numbers rows inside each group; filter the number in an outer query.
 avoid: Filtering a window function in WHERE of the same query (wrap it in a CTE first); ROW_NUMBER when ties should share a place (use RANK or DENSE_RANK).
+manual: window functions ROW_NUMBER RANK DENSE_RANK OVER PARTITION BY
 
 ## Example
 Q: The highest-paid employee in each department.
