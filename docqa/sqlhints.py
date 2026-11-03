@@ -76,7 +76,10 @@ class ValueIndex:
                     )
                     with db._engine.connect() as conn:
                         _guard(conn, start + time_budget)
-                        rows = conn.execute(q).fetchall()
+                        try:
+                            rows = conn.execute(q).fetchall()
+                        finally:
+                            _guard(conn, None)
                 except Exception as e:  # odd column type, permissions, timeout
                     log.debug("Value index skipped %s.%s: %s", table.name, col.name, e)
                     continue
@@ -119,11 +122,18 @@ class ValueIndex:
         return found[:limit]
 
 
-def _guard(conn, deadline: float) -> None:
-    """Stop a long SQLite scan at the deadline (no-op on other databases)."""
+def _guard(conn, deadline: float | None) -> None:
+    """Stop a long SQLite statement at the deadline; ``None`` removes the guard (no-op on other databases).
+
+    The connection goes back to the pool afterwards, so the guard must be removed:
+    a leftover handler with a passed deadline would interrupt every later query on it.
+    """
     try:
         raw = conn.connection.driver_connection
-        raw.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 50_000)
+        if deadline is None:
+            raw.set_progress_handler(None, 0)
+        else:
+            raw.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 50_000)
     except Exception:
         pass
 

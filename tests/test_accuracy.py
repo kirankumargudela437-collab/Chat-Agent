@@ -315,3 +315,38 @@ def test_bird_evidence_travels_with_the_question():
     assert bm.with_evidence("Youngest patient?", "youngest refers to MAX(Birthday)") == (
         "Youngest patient?\nHint (definitions to follow exactly): youngest refers to MAX(Birthday)")
     assert bm.with_evidence("q?", "") == "q?"
+
+
+def _big_db(tmp_path):
+    rows = ",".join(f"({i})" for i in range(3000))
+    make_db(tmp_path / "big.sqlite", f"CREATE TABLE t (x INTEGER); INSERT INTO t VALUES {rows};")
+    return open_database(f"sqlite:///{tmp_path / 'big.sqlite'}")
+
+
+def test_runaway_query_is_stopped(tmp_path):
+    import time
+
+    import pytest
+
+    from docqa.sql import run_query
+
+    db = _big_db(tmp_path)
+    start = time.monotonic()
+    with pytest.raises(TimeoutError, match="simpler query"):
+        run_query(db, "SELECT count(*) FROM t a, t b, t c", 10, timeout=0.5)
+    assert time.monotonic() - start < 5
+    # the guard is removed: the same pooled connection still runs long-ish queries
+    assert run_query(db, "SELECT count(*) FROM t a, t b", 10, timeout=None).rows == [(9_000_000,)]
+
+
+def test_value_index_leaves_no_guard_behind(tmp_path):
+    from docqa.sql import run_query
+
+    import time
+
+    rows = ",".join(f"({i}, 'v{i}')" for i in range(3000))
+    make_db(tmp_path / "big.sqlite", f"CREATE TABLE t (x INTEGER, name TEXT); INSERT INTO t VALUES {rows};")
+    db = open_database(f"sqlite:///{tmp_path / 'big.sqlite'}")
+    assert len(ValueIndex(db, time_budget=0.5)) > 0
+    time.sleep(0.6)  # the scan's deadline has passed; a leftover guard would interrupt the next query
+    assert run_query(db, "SELECT count(*) FROM t a, t b", 10, timeout=None).rows == [(9_000_000,)]

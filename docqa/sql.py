@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -283,15 +284,35 @@ class QueryResult:
     truncated: bool
 
 
-def run_query(db, sql: str, max_rows: int) -> QueryResult:
-    """Run one checked query, fetch at most ``max_rows`` rows, always roll back."""
+QUERY_TIMEOUT = 30.0  # seconds; a runaway join on a big SQLite file would otherwise hang the agent
+
+
+def run_query(db, sql: str, max_rows: int, timeout: float | None = QUERY_TIMEOUT) -> QueryResult:
+    """Run one checked query, fetch at most ``max_rows`` rows, always roll back.
+
+    On SQLite the query is stopped after ``timeout`` seconds (other databases use
+    their own statement timeouts); the error tells the model to write a cheaper query.
+    """
+    from .sqlhints import _guard
+
     with db._engine.connect() as conn:
+        if timeout:
+            _guard(conn, time.monotonic() + timeout)
         try:
             # no_parameters: '%' and ':name' inside the SQL are passed to the driver untouched
             res = conn.execution_options(no_parameters=True).exec_driver_sql(sql)
             columns = list(res.keys()) if res.returns_rows else []
             rows = [tuple(r) for r in res.fetchmany(max_rows + 1)] if res.returns_rows else []
+        except Exception as e:
+            if timeout and "interrupted" in str(e).lower():
+                raise TimeoutError(
+                    f"query ran longer than {timeout:g}s and was stopped; write a simpler query "
+                    "(filter early, join on keys, avoid cross joins and correlated subqueries)"
+                ) from e
+            raise
         finally:
+            if timeout:
+                _guard(conn, None)
             conn.rollback()
     return QueryResult(columns, rows[:max_rows], len(rows) > max_rows)
 
