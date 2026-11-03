@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ class Settings:
     top_k: int = 4
     use_docling: bool = False
     temperature: float = 0.0
+    num_ctx: int = 8192
     extensions: tuple[str, ...] = field(default=(".pdf", ".docx", ".md", ".markdown", ".txt"))
 
     def __post_init__(self) -> None:
@@ -74,18 +76,26 @@ class Settings:
             chunk_overlap=int(_env("DOCQA_CHUNK_OVERLAP", "150")),
             top_k=int(_env("DOCQA_TOP_K", "4")),
             use_docling=_env("DOCQA_USE_DOCLING", "0").lower() in ("1", "true", "yes"),
+            num_ctx=int(_env("DOCQA_NUM_CTX", "8192")),
         )
 
     @property
     def collection_name(self) -> str:
-        """One collection per embedding model.
+        """One collection per embedding model *and* docs folder.
 
         Vectors from different embedding models are not comparable (and often have
         different dimensions), so switching models gets a fresh collection and a
-        fresh record-manager namespace instead of silently mixing them.
+        fresh record-manager namespace instead of silently mixing them. The docs
+        folder is part of the key too: the sync deletes every chunk it did not see,
+        so two folders sharing one collection would wipe each other's chunks.
+
+        Chroma names must end in a letter or digit, so the readable slug is cut
+        short and a hash of the full key keeps long model names distinct.
         """
-        slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{self.embed_provider}-{self.embed_model}").strip("-")
-        return f"docs-{slug}"[:63]
+        key = f"{self.embed_provider}:{self.embed_model}:{self.docs_dir.resolve().as_posix()}"
+        digest = hashlib.sha256(key.encode()).hexdigest()[:10]
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{self.embed_provider}-{self.embed_model}").strip("-")[:40].strip("-")
+        return f"docs-{slug}-{digest}"
 
     @property
     def chroma_dir(self) -> Path:
