@@ -436,11 +436,18 @@ class DocsContext:
     business rules, in any format the app reads) and, optionally, general SQL reference
     material in other folders. It is indexed once with the app's own sync (incremental, so
     a re-run re-embeds nothing). For a question, once the agent has picked its database,
-    the passages come from that database's folder only (hybrid vector + keyword search),
-    plus one reference page per SQL technique the question needs.
+    the passages come from that database's folder only (hybrid vector + keyword search).
+
+    ``slim`` (the default) gives the model only the lines of the top 2 passages that
+    explain values (codes, units, meanings), and SQL reference pages only when a query
+    fails on a function, date or syntax error (``help_for_error``). Measured on BIRD 30:
+    four to six whole passages per question made a 7B model add columns and joins it saw
+    in them (66.7% -> 53.3%). ``slim=False`` restores whole passages plus one reference
+    page per SQL technique.
     """
 
-    def __init__(self, settings, docs_dir: Path, top_k: int = 4, patterns=None, embeddings=None):
+    def __init__(self, settings, docs_dir: Path, top_k: int = 4, patterns=None, embeddings=None,
+                 slim: bool = True):
         import dataclasses
 
         from langchain_core.documents import Document
@@ -462,6 +469,7 @@ class DocsContext:
         self.top_k = top_k
         self.patterns = patterns
         self.reference_folders: list[str] = []  # set by the caller: folders that are not databases
+        self.slim = slim
 
     def _search(self, query: str, folders: list[str], k: int) -> list:
         from .keyword import reciprocal_rank_fusion
@@ -476,6 +484,12 @@ class DocsContext:
     def for_database(self, database: str, question: str) -> str:
         from .chain import citation_label
 
+        if self.slim:
+            from .sqlchecks import value_notes
+
+            notes = value_notes([d.page_content for d in self._search(question, [database], 2)])
+            return ("Notes from the documents on what values mean (they explain values; they do not "
+                    "ask for extra columns or joins):\n" + notes) if notes else ""
         found = self._search(question, [database], self.top_k)
         if self.patterns is not None and self.reference_folders:
             for p in self.patterns.search(question):
@@ -485,6 +499,19 @@ class DocsContext:
         return "Passages from the documents:\n\n" + "\n\n".join(
             f"[{i}] (source: {citation_label(d)})\n{d.page_content}" for i, d in enumerate(found, 1)
         )
+
+
+    def help_for_error(self, error: str, sql: str, max_chars: int = 900) -> str:
+        """One SQL reference page for a function / date / syntax error, for the fix prompt."""
+        from .sqlchecks import manual_query
+
+        query = manual_query(error, sql)
+        if not query or not self.reference_folders:
+            return ""
+        found = self._search(query, self.reference_folders, 1)
+        if not found:
+            return ""
+        return "From the SQL manual:\n" + found[0].page_content[:max_chars]
 
 
 def with_evidence(question: str, evidence: str) -> str:

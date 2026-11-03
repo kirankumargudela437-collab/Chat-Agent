@@ -45,6 +45,7 @@ from typing import Any, Optional, TypedDict
 import sqlglot
 from sqlglot import exp
 
+from .sqlchecks import REVIEW_PROMPT, dry_run, parse_review, result_problems
 from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
@@ -357,6 +358,8 @@ _RULES = (
     "- Write ONE read-only {dialect_name} query (SELECT or WITH ... SELECT). Never modify data.\n"
     "- Use only tables and columns that appear in the schema. Do not invent names.\n"
     "- Apply the business rules and definitions from the context exactly (status codes, KPI formulas, exclusions).\n"
+    "- Documents explain business terms, codes and values; never add a column, table or join just because a "
+    "passage mentions it. Use only what the question asks for.\n"
     "- Prefer readable CTEs over nested subqueries; use window functions (ROW_NUMBER, RANK, LAG, LEAD, "
     "SUM() OVER) where they fit; guard divisions with NULLIF and handle NULLs with COALESCE.\n"
     "- Return exactly the columns the question asks for, in the order it asks; no extra columns.\n"
@@ -446,6 +449,9 @@ class SQLState(TypedDict, total=False):
     executed: bool
     hint: str
     votes: int
+    checked: list
+    fallback: Optional[dict]
+    reviewed: bool
 
 
 @dataclass
@@ -497,6 +503,8 @@ class SQLAgent:
         sql_candidates: int = 1,
         route_margin: float = 0.25,
         route_choices: int = 2,
+        answer_checks: bool = True,
+        review: bool = False,
     ):
         """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
         self.llm = llm
@@ -527,6 +535,9 @@ class SQLAgent:
             extra = load_patterns(patterns_dir) if patterns_dir else ()
             self._patterns = PatternIndex(load_patterns() + extra)
         self.sql_candidates = max(1, sql_candidates)
+        self.answer_checks = answer_checks  # EXPLAIN first; re-ask once when a result looks wrong
+        self.review = review  # the model reviews its own query and first rows (one extra call)
+        self.error_help = None  # (error, sql) -> manual text shown when fixing a failed query
         self._value_indexes: dict[str, object] = {}
         self.max_attempts = max_attempts
         self.max_rows = max_rows
@@ -535,6 +546,7 @@ class SQLAgent:
         self._generate = GENERATE_PROMPT | llm | StrOutputParser()
         self._fix = FIX_PROMPT | llm | StrOutputParser()
         self._summary = SUMMARY_PROMPT | llm | StrOutputParser()
+        self._review = REVIEW_PROMPT | llm | StrOutputParser()
         self._graph = self._build_graph()
 
     # -- schema ---------------------------------------------------------------------
@@ -684,6 +696,8 @@ class SQLAgent:
         if self.db is None:
             return {"sql": sql, "executed": False}
         try:
+            if self.answer_checks:
+                dry_run(self.db, sql)  # names and syntax, without running a heavy query
             res = run_query(self.db, sql, self.max_rows)
         except Exception as e:  # the exact database error drives the next attempt
             error = _db_error(e)
@@ -692,13 +706,47 @@ class SQLAgent:
                 try:
                     res = run_query(self.db, fixed, self.max_rows)
                     log.info("Repaired identifiers: %s -> %s", sql, fixed)
-                    return {"sql": fixed, "result": res, "executed": True}
+                    return self._checked(s, fixed, res)
                 except Exception as e2:
                     error = _db_error(e2)
                     sql = fixed
             hint = error_hint(self.db, sql, error, self.dialect)
+            if self.error_help is not None:  # a manual page for function / date / syntax errors
+                try:
+                    manual = self.error_help(error, sql)
+                except Exception as e2:  # pragma: no cover - never let a lookup break the loop
+                    log.debug("error_help failed: %s", e2)
+                    manual = ""
+                hint = "\n".join(filter(None, [hint, manual]))
             return self._fail(s, f"{error}\n{hint}" if hint else error)
-        return {"sql": sql, "result": res, "executed": True}
+        return self._checked(s, sql, res)
+
+    def _checked(self, s: SQLState, sql: str, res: QueryResult) -> dict:
+        """A query that ran: accept it, or send it back once per kind of suspicious result."""
+        ok = {"sql": sql, "result": res, "executed": True}
+        if s.get("attempts", 0) >= self.max_attempts:
+            return ok
+        problem = None
+        if self.answer_checks:
+            seen = s.get("checked") or []
+            problem = next(((k, m) for k, m in result_problems(s["question"], sql, res.columns, res.rows)
+                            if k not in seen), None)
+        if problem is None and self.review and not s.get("reviewed"):
+            reply = self._review.invoke({"question": s["question"], "sql": sql, "n_rows": len(res.rows),
+                                         "table": rows_as_text(res.columns, res.rows, limit=5)})
+            good, reason = parse_review(reply)
+            if not good:
+                problem = ("review", f"A reviewer says the query does not answer the question: {reason} "
+                                     "If you are sure it does, return the same query unchanged.")
+        if problem is None:
+            return ok
+        kind, message = problem
+        out = self._fail({**s, "sql": sql}, f"Answer check: {message}")
+        out.update(sql=sql, checked=[*(s.get("checked") or []), kind],
+                   reviewed=bool(s.get("reviewed")) or kind == "review",
+                   # the first query that ran is kept if the re-ask does no better
+                   fallback=s.get("fallback") or {"sql": sql, "result": res})
+        return out
 
     def _fail(self, s: SQLState, error: str) -> dict:
         log.info("SQL attempt %s failed: %s", s.get("attempts"), error)
@@ -762,7 +810,7 @@ class SQLAgent:
         if _ASKS_FOR_ALL.search(question):
             base["hint"] = ALL_INFO_HINT
         limit = {"recursion_limit": 4 * self.max_attempts + 10}
-        states = [self._graph.invoke(base, limit)]
+        states = [_settle(self._graph.invoke(base, limit))]
         if self.sql_candidates > 1 and self.db is not None:
             shots = list(examples or [])
             for i in range(1, self.sql_candidates):
@@ -773,7 +821,7 @@ class SQLAgent:
                     # different example order/subset per candidate (MCS-SQL)
                     "examples": shots[i % len(shots):] + shots[: i % len(shots)] if shots else [],
                 }
-                states.append(self._graph.invoke(variant, limit))
+                states.append(_settle(self._graph.invoke(variant, limit)))
         state = vote(states)
         return self._result(question, state, candidates, len(states))
 
@@ -880,6 +928,20 @@ CANDIDATE_HINTS = (
     "Before writing, re-check which table each column belongs to and the exact filter values.",
     "Prefer a simple query: no extra columns, no extra joins, only what the question asks for.",
 )
+
+
+def _settle(state: dict) -> dict:
+    """After the loop: if the re-asked query failed, keep the earlier one that ran.
+
+    A re-ask that runs is accepted as the answer (it is the corrected one); the
+    earlier query only comes back when every later attempt ended in an error.
+    """
+    fb = state.get("fallback")
+    if fb and state.get("error"):
+        failures = list(state.get("failures", []))
+        return {**state, "sql": fb["sql"], "result": fb["result"], "executed": True, "error": None,
+                "failures": failures}
+    return state
 
 
 def _result_key(res: QueryResult) -> tuple:

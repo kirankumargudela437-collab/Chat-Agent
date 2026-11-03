@@ -257,6 +257,8 @@ def cmd_eval(args) -> int:
             sql_candidates=args.sql_candidates or s.sql_candidates,
             route_margin=s.sql_route_margin if args.route_margin is None else args.route_margin,
             route_choices=args.route_choices or s.sql_route_choices,
+            answer_checks=s.sql_answer_checks and not args.no_checks,
+            review=s.sql_review or args.review,
         )
         bank = None
         if args.shots:
@@ -271,8 +273,10 @@ def cmd_eval(args) -> int:
         if args.docs:
             from .benchmark import DocsContext
 
-            docs = DocsContext(s, Path(args.docs), top_k=s.top_k, patterns=agent._patterns)
+            docs = DocsContext(s, Path(args.docs), top_k=s.top_k, patterns=agent._patterns, slim=not args.docs_full)
             docs.reference_folders = [f for f in docs.docs_by_folder if f not in catalog.paths]
+            if docs.slim:
+                agent.error_help = docs.help_for_error
             print(f"Documents: {args.docs}: {docs.sync.summary().splitlines()[0]}; "
                   f"{len(docs.docs_by_folder) - len(docs.reference_folders)} database folders, "
                   f"reference folders: {', '.join(docs.reference_folders) or 'none'}")
@@ -293,7 +297,7 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'docs_full': args.docs_full, 'checks': s.sql_answer_checks and not args.no_checks, 'review': s.sql_review or args.review, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
@@ -392,7 +396,14 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--train", help="folder with the training questions for --shots (default: next to dev.json)")
     ev.add_argument("--no-values", action="store_true", help="don't look up matching database values")
     ev.add_argument("--docs", help="a documents folder (one sub-folder per database, e.g. a data dictionary); "
-                    "each question gets passages from its database's folder, as in the app")
+                    "each question gets the value notes of its database's folder; reference folders (an SQL "
+                    "manual) are shown only when a query fails")
+    ev.add_argument("--docs-full", action="store_true", help="with --docs: whole passages plus a manual page per "
+                    "technique on every question (the round 5b behaviour)")
+    ev.add_argument("--no-checks", action="store_true", help="don't EXPLAIN first or re-ask on suspicious results "
+                    "(empty, all NULL, duplicated rows, percentage outside 0-100)")
+    ev.add_argument("--review", action="store_true", help="the model reviews its own query and first rows and "
+                    "rewrites it once if it says WRONG (one more model call per question)")
     ev.add_argument("--no-patterns", action="store_true", help="don't show worked examples of SQL techniques")
     ev.add_argument("--sql-candidates", type=int, help="write N queries and keep the majority result (default DOCQA_SQL_CANDIDATES=1)")
     ev.set_defaults(func=cmd_eval)

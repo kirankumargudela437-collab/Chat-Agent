@@ -110,6 +110,8 @@ class Agent:
         self.sql_agent = sql_agent or SQLAgent(llm)
         if self.sql_agent.embeddings is None:  # reuse the index's embeddings to pick tables in big databases
             self.sql_agent.embeddings = getattr(vectorstore, "embeddings", None)
+        if self.sql_agent.error_help is None:
+            self.sql_agent.error_help = self._manual_help
         self.max_history_messages = max_history_messages
         self.schema = schema  # DDL / table list pasted by the user
         self.history: list[BaseMessage] = []
@@ -212,23 +214,18 @@ class Agent:
                 if key not in seen:
                     seen.add(key)
                     docs.append(d)
-        # SQL reference documents (a manual, a cheat sheet) share no words with a business
-        # question, so they are searched by the techniques the question needs instead.
-        for d in self._manual_pages(question):
-            key = doc_key(d)
-            if key not in seen:
-                seen.add(key)
-                docs.append(d)
         return docs
 
-    def _manual_pages(self, question: str, per_pattern: int = 1) -> list[Document]:
-        patterns = getattr(self.sql_agent, "_patterns", None)
-        if patterns is None or "doc" not in self.categories:
-            return []
-        found: list[Document] = []
-        for p in patterns.search(question):
-            found += self._find(p.manual, "doc", per_pattern)
-        return found
+    def _manual_help(self, error: str, sql: str, max_chars: int = 900) -> str:
+        """A page from an SQL manual in the documents, shown only when a query failed on a
+        function, date or syntax error (on every question it distracted a small model)."""
+        from .sqlchecks import manual_query
+
+        query = manual_query(error, sql)
+        if not query or "doc" not in self.categories:
+            return ""
+        found = self._find(query, "doc", 1)
+        return f"From the documents ({citation_label(found[0])}):\n{found[0].page_content[:max_chars]}" if found else ""
 
     def run_sql(self, sql: str) -> SQLResult:
         """Run the user's own SQL (``/run SELECT ...``) through the same read-only checks."""

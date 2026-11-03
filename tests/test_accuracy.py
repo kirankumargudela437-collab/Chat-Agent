@@ -1,6 +1,9 @@
 """Accuracy features for small models: value lookup, error hints, few-shot bank, voting, Spider scoring."""
 
 import json
+import sqlite3
+
+import pytest
 
 from langchain_core.language_models import FakeListChatModel
 
@@ -460,10 +463,122 @@ def test_eval_docs_context_comes_from_the_routed_database_folder(tmp_path, embed
     (docs / "sql_manual" / "window.md").write_text(
         "# Window functions\n\nROW_NUMBER() OVER (PARTITION BY ...) numbers rows within each partition.\n", encoding="utf-8")
     s = Settings(docs_dir=docs, data_dir=tmp_path / "data", chunk_size=200, chunk_overlap=40)
-    ctx = bm.DocsContext(s, docs, top_k=3, patterns=PatternIndex(), embeddings=embeddings)
+    ctx = bm.DocsContext(s, docs, top_k=3, patterns=PatternIndex(), embeddings=embeddings, slim=False)
     ctx.reference_folders = ["sql_manual"]
     text = ctx.for_database("european_football", "Which country has the most matches? Rank the top 2 in each league")
     assert "Slovakia" in text and "Country.pdf" in text
     assert "rarity" not in text  # another database's documents never leak in
     assert "ROW_NUMBER" in text  # the reference page for the ranking technique
     assert ctx.for_database("unknown_db", "anything") == "" or "rarity" not in ctx.for_database("unknown_db", "x")
+
+
+# --------------------------------------------------------------------------- slim docs + answer checks
+
+
+def test_slim_docs_keep_only_value_notes_and_manual_comes_on_error(tmp_path, embeddings):
+    from docqa.config import Settings
+    from docqa.sqlpatterns import PatternIndex
+
+    docs = tmp_path / "docs"
+    (docs / "shop").mkdir(parents=True)
+    (docs / "sql_manual").mkdir()
+    (docs / "shop" / "dictionary.md").write_text(
+        "# orders\n\norders.customer_name: the name of the customer who placed the order.\n"
+        "orders.status: order status code; 'S' stands for shipped, 'C' means cancelled.\n", encoding="utf-8")
+    (docs / "sql_manual" / "dates.md").write_text(
+        "# Date functions\n\nstrftime('%Y', date) returns the year of a date as text.\n", encoding="utf-8")
+    s = Settings(docs_dir=docs, data_dir=tmp_path / "data", chunk_size=400, chunk_overlap=40)
+    ctx = bm.DocsContext(s, docs, top_k=3, patterns=PatternIndex(), embeddings=embeddings)
+    ctx.reference_folders = ["sql_manual"]
+    text = ctx.for_database("shop", "How many orders were shipped?")
+    assert "stands for shipped" in text
+    assert "customer_name" not in text  # a plain column description is what distracted the model
+    assert "strftime" not in text  # the manual is not shown up front any more
+    help_text = ctx.help_for_error("no such function: YEAR", "SELECT YEAR(o.date) FROM orders o")
+    assert "strftime" in help_text
+    assert ctx.help_for_error("no such column: o.foo", "SELECT o.foo FROM orders o") == ""
+
+
+def test_result_checks_flag_suspicious_answers():
+    from docqa.sqlchecks import result_problems
+
+    assert result_problems("How many?", "SELECT 1", ["n"], [])[0][0] == "empty"
+    assert result_problems("Who?", "SELECT x FROM t", ["x"], [(None,), (None,)])[0][0] == "nulls"
+    dup = result_problems("List the names", "SELECT a.name FROM a JOIN b ON 1", ["name"], [("x",)] * 6)
+    assert dup[0][0] == "dupes"
+    assert not result_problems("List the names", "SELECT DISTINCT name FROM a", ["name"], [("x",)] * 6)
+    assert result_problems("What percentage of cards are rare?", "SELECT ...", ["p"], [(340.0,)])[0][0] == "range"
+    assert not result_problems("What percentage of cards are rare?", "SELECT ...", ["p"], [(34.0,)])
+    assert result_problems("Ages", "SELECT ...", ["age"], [(-3,)])[0][0] == "range"
+    assert not result_problems("How many members?", "SELECT COUNT(*) FROM m", ["n"], [(12,)])
+
+
+def test_answer_check_reasks_once_and_keeps_a_correct_empty_answer(tmp_path):
+    db_path = tmp_path / "shop.db"
+    con = sqlite3.connect(db_path)
+    con.executescript("CREATE TABLE orders (id INTEGER, status TEXT); INSERT INTO orders VALUES (1, 'S'), (2, 'C');")
+    con.commit(); con.close()
+    from docqa.sql import SQLAgent, open_database
+
+    # 1st query is empty (wrong value) -> re-asked -> 2nd query uses the right code
+    llm = FakeListChatModel(responses=[
+        "```sql\nSELECT id FROM orders WHERE status = 'shipped'\n```",
+        "```sql\nSELECT id FROM orders WHERE status = 'S'\n```",
+    ])
+    agent = SQLAgent(llm, db=open_database(f"sqlite:///{db_path}"), schema_linking=False, value_lookup=False,
+                     sql_patterns=False)
+    r = agent.run("Which orders were shipped?")
+    assert r.rows == [(1,)] and r.attempts == 2 and r.error is None
+    assert any("Answer check" in e for _, e in r.failures)
+
+    # empty is really the answer: the model returns the same query, which is accepted (no loop)
+    same = "```sql\nSELECT id FROM orders WHERE status = 'X'\n```"
+    agent = SQLAgent(FakeListChatModel(responses=[same, same]), db=open_database(f"sqlite:///{db_path}"),
+                     schema_linking=False, value_lookup=False, sql_patterns=False)
+    r = agent.run("Which orders have status X?")
+    assert r.rows == [] and r.attempts == 2 and r.error is None and r.executed
+
+    # the re-ask fails to run every time -> the first query that ran is kept
+    agent = SQLAgent(FakeListChatModel(responses=[same, "```sql\nSELECT nope FROM orders\n```"]),
+                     db=open_database(f"sqlite:///{db_path}"), schema_linking=False, value_lookup=False,
+                     sql_patterns=False, max_attempts=2)
+    r = agent.run("Which orders have status X?")
+    assert r.executed and r.error is None and "status = 'X'" in r.sql
+
+    # --no-checks: one query, no re-ask
+    agent = SQLAgent(FakeListChatModel(responses=[same]), db=open_database(f"sqlite:///{db_path}"),
+                     schema_linking=False, value_lookup=False, sql_patterns=False, answer_checks=False)
+    assert agent.run("Which orders have status X?").attempts == 1
+
+
+def test_dry_run_catches_unknown_names_before_running(tmp_path):
+    db_path = tmp_path / "s.db"
+    con = sqlite3.connect(db_path); con.execute("CREATE TABLE t (a INTEGER)"); con.commit(); con.close()
+    from docqa.sql import open_database
+    from docqa.sqlchecks import dry_run
+
+    db = open_database(f"sqlite:///{db_path}")
+    dry_run(db, "SELECT a FROM t")
+    with pytest.raises(Exception, match="no such column"):
+        dry_run(db, "SELECT b FROM t")
+
+
+def test_review_rewrites_once_when_the_model_says_wrong(tmp_path):
+    db_path = tmp_path / "r.db"
+    con = sqlite3.connect(db_path)
+    con.executescript("CREATE TABLE p (id INTEGER, name TEXT, age INTEGER); INSERT INTO p VALUES (1,'a',30),(2,'b',40);")
+    con.commit(); con.close()
+    from docqa.sql import SQLAgent, open_database
+    from docqa.sqlchecks import parse_review
+
+    assert parse_review("OK") == (True, "")
+    assert parse_review("WRONG: the question asks only for names")[0] is False
+    llm = FakeListChatModel(responses=[
+        "```sql\nSELECT id, name FROM p\n```",
+        "WRONG - the question asks only for the names",
+        "```sql\nSELECT name FROM p\n```",
+    ])
+    agent = SQLAgent(llm, db=open_database(f"sqlite:///{db_path}"), schema_linking=False, value_lookup=False,
+                     sql_patterns=False, review=True)
+    r = agent.run("List the names")
+    assert r.columns == ["name"] and r.attempts == 2

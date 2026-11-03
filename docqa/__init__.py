@@ -54,6 +54,8 @@ def build_sql_agent(settings: Settings, llm=None, catalog=None):
         sql_candidates=settings.sql_candidates,
         route_margin=settings.sql_route_margin,
         route_choices=settings.sql_route_choices,
+        answer_checks=settings.sql_answer_checks,
+        review=settings.sql_review,
     )
 
 

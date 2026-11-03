@@ -371,6 +371,23 @@ shares no words with a manual. Pattern examples are now translated into the conn
 dialect with sqlglot (Oracle `FETCH FIRST n ROWS ONLY`, SQL Server `TOP n`, ...), and the 30 s query
 limit also applies on Postgres, MySQL and Oracle.
 
+Measured on BIRD 30 with qwen2.5-coder:7b: patterns 66.7%, patterns + whole passages 53.3%. The
+passages came from the right database every time, but four to six of them made the model add
+columns and joins it read about. So `--docs` now gives only the lines that explain values (codes,
+units, meanings) from the top 2 passages, the SQL manual only when a query fails on a function,
+date or syntax error, and a rule that documents explain values and never add columns or joins
+(`--docs-full` restores the old behaviour). The app also shows manual pages only on such errors.
+
+**Answer checks.** Syntax, safety and database errors were already checked and sent back to the
+model. But every wrong answer of the best BIRD run was valid SQL that ran. Now each query is
+`EXPLAIN`ed first (names and syntax, before a heavy query starts), and a result that looks wrong
+is sent back once with what is suspicious: no rows, a column that is NULL in every row, rows
+multiplied by a join, a percentage outside 0-100 or a negative count. Each kind fires at most once
+per question; if the model returns the same query it is accepted, and if the re-ask fails to run
+the first query is kept. `DOCQA_SQL_REVIEW=1` (`--review`) adds a self-review: the model sees its
+query and first rows and answers OK or WRONG with a reason. Turn the checks off with
+`DOCQA_SQL_CHECKS=0` (`--no-checks`).
+
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
 tells you to download in a browser and pass `--zip`. The schema indexer built `PRAGMA table_info('{t}')`
