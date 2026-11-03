@@ -252,6 +252,8 @@ def cmd_eval(args) -> int:
             db_router=args.router or s.sql_db_router,
             db_candidates=k,
             value_lookup=s.sql_value_lookup and not args.no_values,
+            sql_patterns=s.sql_patterns and not args.no_patterns,
+            patterns_dir=str(s.sql_patterns_dir) if s.sql_patterns_dir else None,
             sql_candidates=args.sql_candidates or s.sql_candidates,
             route_margin=s.sql_route_margin if args.route_margin is None else args.route_margin,
             route_choices=args.route_choices or s.sql_route_choices,
@@ -282,7 +284,7 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
@@ -380,6 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--shots", type=int, default=0, help="show N similar solved training questions per question (DAIL-SQL style)")
     ev.add_argument("--train", help="folder with the training questions for --shots (default: next to dev.json)")
     ev.add_argument("--no-values", action="store_true", help="don't look up matching database values")
+    ev.add_argument("--no-patterns", action="store_true", help="don't show worked examples of SQL techniques")
     ev.add_argument("--sql-candidates", type=int, help="write N queries and keep the majority result (default DOCQA_SQL_CANDIDATES=1)")
     ev.set_defaults(func=cmd_eval)
 

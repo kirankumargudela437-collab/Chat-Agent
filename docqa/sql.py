@@ -474,6 +474,8 @@ class SQLAgent:
         db_router: str = "llm",
         db_candidates: int = 5,
         value_lookup: bool = True,
+        sql_patterns: bool = True,
+        patterns_dir: str | None = None,
         sql_candidates: int = 1,
         route_margin: float = 0.25,
         route_choices: int = 2,
@@ -500,6 +502,12 @@ class SQLAgent:
         if db is not None and db.dialect == "sqlite":
             self.dialect = "sqlite"
         self.value_lookup = value_lookup
+        self._patterns = None
+        if sql_patterns:  # reference examples of SQL techniques, retrieved per question
+            from .sqlpatterns import PatternIndex, load_patterns
+
+            extra = load_patterns(patterns_dir) if patterns_dir else ()
+            self._patterns = PatternIndex(load_patterns() + extra)
         self.sql_candidates = max(1, sql_candidates)
         self._value_indexes: dict[str, object] = {}
         self.max_attempts = max_attempts
@@ -718,6 +726,7 @@ class SQLAgent:
                 name, candidates = self.route(question)
             self.use_database(name)
         context = self._with_value_hints(question, context)
+        context = self._with_patterns(question, context)
         base = {
             "question": question,
             "schema": self.schema_text(schema, question, context),
@@ -743,6 +752,17 @@ class SQLAgent:
                 states.append(self._graph.invoke(variant, limit))
         state = vote(states)
         return self._result(question, state, candidates, len(states))
+
+    def _with_patterns(self, question: str, context: str) -> str:
+        """Append the SQL techniques that fit the question, with worked examples."""
+        if self._patterns is None:
+            return context
+        from .sqlpatterns import format_patterns
+
+        text = format_patterns(self._patterns.search(question))
+        if not text:
+            return context
+        return f"{context}\n\n{text}" if context else text
 
     def _with_value_hints(self, question: str, context: str) -> str:
         """Append the database values the question mentions (CHESS-style value retrieval)."""

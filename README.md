@@ -346,6 +346,22 @@ names "Student_Club" outright. Schema fit now counts the database's own name (a 
 multi-word name +0.3, a single word +0.1), and the default margin is 0.25: on 200 Spider
 questions a lead that large covered 54% of questions with #1 right every time.
 
+**SQL pattern library.** `docqa/sql_patterns/` holds 22 SQL techniques, each with five worked
+examples on one small demo shop schema (`demo_schema.sql`): filtering and AND/OR, NULLs, top N,
+aggregation, GROUP BY / HAVING, joins through bridge tables, LEFT JOIN, negation (NOT EXISTS /
+NOT IN / EXCEPT), subqueries, CTEs, ranking per group, running totals and shares, LAG / LEAD,
+set operations, CASE pivots, percentages, dates (SQLite, Postgres and MySQL notes), text
+functions, "the row with the highest", self-joins, recursive hierarchies and DISTINCT. Each
+file says when to use the technique and the usual mistake. For every question the best one or
+two techniques are retrieved by their cue words ("never", "running total", "top ... each") and
+shown to the model with two examples, labelled as a demo schema so it copies the technique and
+not the names. Nothing in it depends on your databases, so it does not go stale when your SQL
+changes. The tests run all 110 examples against the demo database.
+
+Add your own techniques or house rules as more `.md` files in the same format in a folder of
+your choice and set `DOCQA_SQL_PATTERNS_DIR`. Turn the library off with `DOCQA_SQL_PATTERNS=0`
+(`docqa eval ... --no-patterns` to measure it).
+
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
 tells you to download in a browser and pass `--zip`. The schema indexer built `PRAGMA table_info('{t}')`

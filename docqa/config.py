@@ -69,6 +69,8 @@ class Settings:
     sql_max_rows: int = 50
     sql_schema_linking: bool = True
     sql_value_lookup: bool = True     # find database values the question mentions (exact spellings)
+    sql_patterns: bool = True         # show worked examples of the SQL techniques the question needs
+    sql_patterns_dir: Path | None = None  # your own pattern files (same format as docqa/sql_patterns)
     sql_candidates: int = 1           # >1: write several queries, keep the result most of them return
     hybrid_search: bool = True        # keyword (BM25) + vector search
     sql_max_tables: int = 20          # bigger databases: show only the most relevant tables
@@ -138,6 +140,8 @@ class Settings:
             sql_max_rows=int(_env("DOCQA_SQL_MAX_ROWS", "50")),
             sql_schema_linking=_flag("DOCQA_SQL_SCHEMA_LINKING", "1"),
             sql_value_lookup=_flag("DOCQA_SQL_VALUE_LOOKUP", "1"),
+            sql_patterns=_flag("DOCQA_SQL_PATTERNS", "1"),
+            sql_patterns_dir=Path(os.environ["DOCQA_SQL_PATTERNS_DIR"]) if os.getenv("DOCQA_SQL_PATTERNS_DIR") else None,
             sql_candidates=int(_env("DOCQA_SQL_CANDIDATES", "1")),
             sql_max_tables=int(_env("DOCQA_SQL_MAX_TABLES", "20")),
             hybrid_search=_flag("DOCQA_HYBRID_SEARCH", "1"),

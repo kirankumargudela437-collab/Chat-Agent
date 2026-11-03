@@ -372,3 +372,65 @@ def test_value_index_leaves_no_guard_behind(tmp_path):
     assert len(ValueIndex(db, time_budget=0.5)) > 0
     time.sleep(0.6)  # the scan's deadline has passed; a leftover guard would interrupt the next query
     assert run_query(db, "SELECT count(*) FROM t a, t b", 10, timeout=None).rows == [(9_000_000,)]
+
+
+# --------------------------------------------------------------------------- SQL pattern library
+
+
+def test_every_pattern_has_five_examples_that_run():
+    import sqlite3
+
+    from docqa.sqlpatterns import DEMO_SCHEMA, load_patterns
+
+    patterns = load_patterns()
+    assert len(patterns) >= 20 and len({p.id for p in patterns}) == len(patterns)
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(DEMO_SCHEMA.read_text(encoding="utf-8"))
+    for p in patterns:
+        assert len(p.examples) == 5, p.id
+        assert p.use and p.avoid and p.cues, p.id
+        for ex in p.examples:
+            rows = conn.execute(ex.sql).fetchall()  # every example is valid SQL on the demo schema
+            assert rows, f"{p.id}: {ex.question} returned nothing"
+
+
+def test_patterns_are_retrieved_by_technique():
+    from docqa.sqlpatterns import PatternIndex
+
+    idx = PatternIndex()
+
+    def ids(q):
+        return [p.id for p in idx.search(q)]
+
+    assert "negation" in ids("Find the names of stadiums that did not have any concert in 2014.")
+    assert "percentage" in ids("What percentage of students are female?")
+    assert "window-aggregate" in ids("Show me the running total of sales by month")
+    assert "window-rank" in ids("List the top 3 products by revenue in each region")
+    assert "lag-lead" in ids("Monthly revenue growth compared to the previous month")
+    assert "recursive" in ids("Find all employees under manager John at any level")
+    assert "set-ops" in ids("Which students have enrolled in both math and physics?")
+    assert "top-n" in ids("What is the name of the youngest singer?")
+    assert ids("Give all the information about the airline with abbreviation UAL") == []
+
+
+def test_patterns_reach_the_sql_prompt_and_can_be_turned_off(tmp_path):
+    db = _country_db(tmp_path)
+    llm = RecordingLLM(responses=["SELECT 1", "SELECT 1"], prompts=[])
+    SQLAgent(llm, db, schema_linking=False, value_lookup=False).run("What percentage of countries are in Europe?")
+    system = llm.prompts[0][0].content
+    assert "SQL techniques that fit this question" in system and "100.0 *" in system
+    assert "never its table or column names" in system
+    SQLAgent(llm, db, schema_linking=False, value_lookup=False, sql_patterns=False).run("What percentage of countries are in Europe?")
+    assert "SQL techniques" not in llm.prompts[1][0].content
+
+
+def test_own_pattern_files_are_added(tmp_path):
+    (tmp_path / "90_fiscal.md").write_text(
+        "# Fiscal years\nid: fiscal\ncues: fiscal, fy\nuse: Our fiscal year starts in April.\navoid: Calendar years.\n\n"
+        "## Example\nQ: Revenue in FY2024\n```sql\nSELECT 1;\n```\nWhy: April to March.\n",
+        encoding="utf-8",
+    )
+    db = _country_db(tmp_path)
+    llm = RecordingLLM(responses=["SELECT 1"], prompts=[])
+    SQLAgent(llm, db, schema_linking=False, value_lookup=False, patterns_dir=str(tmp_path)).run("Revenue in fiscal 2024?")
+    assert "Our fiscal year starts in April." in llm.prompts[0][0].content
