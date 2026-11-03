@@ -203,10 +203,15 @@ class Agent:
             return []  # no schema or examples indexed: don't pad the SQL prompt with unrelated chunks
         return self._find(query, None, k)
 
-    def _sql_context(self, question: str) -> list[Document]:
+    def _sql_context(self, question: str, scoped: bool = False) -> list[Document]:
+        """Examples, schema files and business documents for the SQL route. With ``scoped``
+        (several databases with their own document folders) the business documents are left
+        out here and fetched for the chosen database after routing (``_database_docs``)."""
         docs: list[Document] = []
         seen = set()
         for cat, k in (("example", self.examples_k), ("sql", self.top_k), ("doc", self.top_k)):
+            if cat == "doc" and scoped:
+                continue
             if cat not in self.categories:
                 continue
             for d in self._find(question, cat, k):
@@ -215,6 +220,31 @@ class Agent:
                     seen.add(key)
                     docs.append(d)
         return docs
+
+    def _has_database_folders(self) -> bool:
+        """Do the documents have a folder per connected database (``<docs>/<database>/...``)?"""
+        catalog = self.sql_agent.catalog
+        if catalog is None or "doc" not in self.categories:
+            return False
+        if getattr(self, "_db_folders", None) is None:
+            got = self.vectorstore.get(where={"category": "doc"}, include=["metadatas"])
+            folders = {str((m or {}).get("source", "")).replace("\\", "/").split("/", 1)[0].lower()
+                       for m in got.get("metadatas") or []}
+            self._db_folders = folders & {str(n).lower() for n in catalog.paths}
+        return bool(self._db_folders)
+
+    def _database_docs(self, database: str, question: str, k: int = 2) -> str:
+        """Passages from the chosen database's own folder, as in ``docqa eval --docs``: picked
+        after routing, so another database's dictionary never reaches the prompt."""
+        if not database or database.lower() not in (self._db_folders or set()):
+            return ""
+        prefix = database.lower() + "/"
+        pool = self._find(question, "doc", 8 * k)
+        found = [d for d in pool if str(d.metadata.get("source", "")).replace("\\", "/").lower().startswith(prefix)][:k]
+        if not found:
+            return ""
+        return f"Passages from the documents about {database}:\n\n" + "\n\n".join(
+            f"(source: {citation_label(d)})\n{d.page_content}" for d in found)
 
     def _manual_help(self, error: str, sql: str, max_chars: int = 900) -> str:
         """A page from an SQL manual in the documents, shown only when a query failed on a
@@ -324,7 +354,8 @@ class Agent:
         """Run one specialist. Appends its passages to ``docs`` (shared citation numbering)."""
         start = len(docs) + 1
         if route == "SQL":
-            context = self._sql_context(question)
+            scoped = self._has_database_folders()
+            context = self._sql_context(question, scoped=scoped)
             docs.extend(context)
             has_schema = (
                 self.sql_agent.db is not None
@@ -344,7 +375,8 @@ class Agent:
                 for d in context
                 if d.metadata.get("category") == "example" and d.metadata.get("question")
             ]
-            result = self.sql_agent.run(question, _numbered(context, start) if context else "", self.schema, examples)
+            result = self.sql_agent.run(question, _numbered(context, start) if context else "", self.schema, examples,
+                                        context_fn=self._database_docs if scoped else None)
             yield result
             summary_tokens = []
             if result.ok and result.executed:

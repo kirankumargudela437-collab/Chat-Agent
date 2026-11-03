@@ -45,7 +45,8 @@ from typing import Any, Optional, TypedDict
 import sqlglot
 from sqlglot import exp
 
-from .sqlchecks import REVIEW_PROMPT, dry_run, parse_review, result_problems
+from .sqlchecks import (REVIEW_PROMPT, dry_run, join_keys, missing_values, parse_review, result_problems,
+                        self_comparisons, tables_in)
 from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
@@ -227,28 +228,53 @@ class Database:
         self._metadata = MetaData()
         self._metadata.reflect(bind=engine, only=self.table_names, views=True)
 
-    def table_infos(self) -> dict[str, str]:
-        """``CREATE TABLE`` (with foreign keys) plus a few sample rows, per table. Cached."""
-        if getattr(self, "_infos", None) is None:
+    def table_parts(self) -> dict[str, dict[str, str]]:
+        """Per table: ``ddl`` (CREATE TABLE with keys), ``compact`` (column names and keys
+        on one line), ``sample`` (a few rows) and ``notes`` (column descriptions). Cached."""
+        if getattr(self, "_parts", None) is None:
             from sqlalchemy import select
             from sqlalchemy.schema import CreateTable
 
-            infos = {}
+            parts = {}
             for table in self._metadata.sorted_tables:
-                info = str(CreateTable(table).compile(self._engine)).strip()
+                p = {"ddl": str(CreateTable(table).compile(self._engine)).strip(), "sample": "", "notes": ""}
+                keys = [c.name for c in table.primary_key.columns]
+                fks = [f"{fk.parent.name} -> {fk.column.table.name}.{fk.column.name}" for fk in table.foreign_keys]
+                cols = ", ".join(c.name for c in table.columns)
+                p["compact"] = (f"-- {table.name}({cols})" + (f"; primary key {', '.join(keys)}" if keys else "")
+                                + (f"; joins {'; '.join(fks)}" if fks else ""))
+                p["keys"] = (f"-- {table.name}: primary key {', '.join(keys) or '?'}"
+                             + (f"; joins {'; '.join(fks)}" if fks else "") + f"; {len(table.columns)} columns")
                 if self.sample_rows:
                     try:
                         with self._engine.connect() as conn:
                             rows = conn.execute(select(table).limit(self.sample_rows)).fetchall()
                         sample = rows_as_text([c.name for c in table.columns], [tuple(r) for r in rows], width=40)
-                        info += f"\n\n/* {len(rows)} sample rows from {table.name}:\n{sample}\n*/"
+                        p["sample"] = f"/* {len(rows)} sample rows from {table.name}:\n{sample}\n*/"
                     except Exception as e:  # pragma: no cover - permissions on one table
                         log.debug("No sample rows for %s: %s", table.name, e)
                 if self.notes.get(table.name):
-                    info += f"\n\n/* Column descriptions for {table.name}:\n{self.notes[table.name]}\n*/"
-                infos[table.name] = info
-            self._infos = infos
+                    p["notes"] = f"/* Column descriptions for {table.name}:\n{self.notes[table.name]}\n*/"
+                parts[table.name] = p
+            self._parts = parts
+        return self._parts
+
+    def table_infos(self) -> dict[str, str]:
+        """``CREATE TABLE`` (with foreign keys) plus a few sample rows, per table. Cached."""
+        if getattr(self, "_infos", None) is None:
+            self._infos = {n: "\n\n".join(filter(None, [p["ddl"], p["sample"], p["notes"]]))
+                           for n, p in self.table_parts().items()}
         return self._infos
+
+    def refresh(self) -> None:
+        """Forget the cached schema (after a table was added or changed)."""
+        from sqlalchemy import MetaData, inspect
+
+        self._parts = self._infos = None
+        self._metadata = MetaData()
+        names = inspect(self._engine).get_table_names() + inspect(self._engine).get_view_names()
+        self.table_names = sorted(n for n in names if not n.startswith("sqlite_"))
+        self._metadata.reflect(bind=self._engine, only=self.table_names, views=True)
 
     def neighbours(self, name: str) -> set[str]:
         """Tables joined to ``name`` by a foreign key, in either direction."""
@@ -367,7 +393,8 @@ _RULES = (
     "- When counting or grouping people or things, GROUP BY their key column (id), not their name: names repeat.\n"
     "- If two tables only connect through a third (a bridge table), join through it using the foreign keys.\n"
     "- For 'not / never / without' questions use NOT IN or EXCEPT, not != on a join.\n"
-    "- For the row with the highest / lowest / latest value ('the most recent order'), use ORDER BY ... LIMIT 1.\n"
+    "- For the row with the highest / lowest / latest value ('the most recent order'), use {top_one}; "
+    "when every tied row should be returned, compare with a subquery (= (SELECT MAX(...) ...)) instead.\n"
     "- Follow the style of the golden examples when one is similar, but use the column names of THIS schema.\n"
     "- Unless the question asks for everything, return at most {max_rows} rows.\n"
     "- Output only the SQL in one ```sql block, no explanation."
@@ -383,8 +410,13 @@ LINK_PROMPT = ChatPromptTemplate.from_messages(
             "- Tables: the tables needed and how they join (exact key columns).\n"
             "- Columns and rules: how each business term in the question maps to columns, filters, "
             "status codes or formulas, citing the passage as [n].\n"
+            "- Answer shape: what ONE result row is about (the entity), the measure it returns, any "
+            "grouping, the denominator of a ratio, and how ties are handled. When the question picks one "
+            "thing by a property ('the oldest player', 'the most expensive set'), say that it selects that "
+            "thing first and then returns its measure: 'the long passing score of the oldest player' is "
+            "one player's score, not MAX(long passing) over all players.\n"
             "- Gaps: anything the question needs that the schema and context do not define.\n"
-            "Do not write the SQL. Be concise.\n\n"
+            "Do not write the SQL. Be concise.{hint}\n\n"
             "Dialect: {dialect_name}\n\nSchema:\n{schema}\n\nContext:\n{context}",
         ),
         ("human", "{question}"),
@@ -471,6 +503,7 @@ class SQLResult:
     candidates: list[str] = field(default_factory=list)  # the databases the router considered
     votes: int = 0  # with several candidate queries: how many returned the chosen result
     n_candidates: int = 1
+    alternatives: list = field(default_factory=list)  # the SQL of every candidate that ran, in order
 
     @property
     def ok(self) -> bool:
@@ -505,6 +538,8 @@ class SQLAgent:
         route_choices: int = 2,
         answer_checks: bool = True,
         review: bool = False,
+        independent_plans: bool = False,
+        schema_ttl: float = 0.0,
     ):
         """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
         self.llm = llm
@@ -537,7 +572,11 @@ class SQLAgent:
         self.sql_candidates = max(1, sql_candidates)
         self.answer_checks = answer_checks  # EXPLAIN first; re-ask once when a result looks wrong
         self.review = review  # the model reviews its own query and first rows (one extra call)
+        self.independent_plans = independent_plans  # each extra candidate plans the question afresh
+        self.schema_ttl = schema_ttl  # seconds before the live schema is read again (0: once per session)
+        self._schema_loaded = time.monotonic()
         self.error_help = None  # (error, sql) -> manual text shown when fixing a failed query
+        self.last_schema: dict[str, str] = {}  # table -> what reached the prompt (keys/columns/ddl+sample+notes)
         self._value_indexes: dict[str, object] = {}
         self.max_attempts = max_attempts
         self.max_rows = max_rows
@@ -566,7 +605,7 @@ class SQLAgent:
         """
         infos = self.db.table_infos()
         names = list(infos)
-        if len(names) <= self.max_tables:
+        if len(names) <= 1:
             return names
         text = f"{question}\n{context}".lower()
         score = {n: 0.0 for n in names}
@@ -585,6 +624,8 @@ class SQLAgent:
                 if words:
                     score[n] += len(words & set(re.findall(r"[a-z0-9_]{3,}", infos[n].lower()))) / len(words)
         ranked = sorted(names, key=lambda n: -score[n])
+        if len(names) <= self.max_tables:
+            return ranked  # every table, most relevant first (the order decides what gets detail)
         top = ranked[: max(1, self.max_tables // 2)]
         chosen = list(top)
         for n in top:
@@ -598,18 +639,15 @@ class SQLAgent:
 
     def schema_text(self, pasted: str = "", question: str = "", context: str = "") -> str:
         parts = []
+        if self.db is not None and self.schema_ttl and time.monotonic() - self._schema_loaded > self.schema_ttl:
+            self.db.refresh()  # pick up tables and columns changed while the chat is open
+            self._table_vectors = None
+            self._schema_loaded = time.monotonic()
         if self.db is not None:
-            infos = self.db.table_infos()
-            shown, used = [], 0
-            for n in self.select_tables(question, context):
-                if shown and used + len(infos[n]) > self.schema_chars:
-                    break
-                shown.append(infos[n])
-                used += len(infos[n])
-            text = "\n\n".join(shown)
-            hidden = len(infos) - len(shown)
-            if hidden:
-                text += f"\n\n-- {hidden} more tables not shown. Ask about them by name to include them."
+            text, report = build_schema(self.db.table_parts(), self.select_tables(question, context),
+                                        self.schema_chars, total=len(self.db.table_names), question=question)
+            self.last_schema = report
+            log.info("Schema in prompt: %s", report)
             parts.append(f"-- Live database ({dialect_name(self.dialect)}):\n{text}")
         if pasted.strip():
             parts.append(f"-- Provided by the user:\n{pasted.strip()}")
@@ -662,6 +700,7 @@ class SQLAgent:
     def _base(self, s: SQLState) -> dict:
         return {
             "dialect_name": dialect_name(self.dialect),
+            "top_one": top_one(self.dialect),
             "max_rows": self.max_rows,
             "schema": s["schema"],
             "context": s.get("context") or "(none)",
@@ -693,6 +732,13 @@ class SQLAgent:
             sql = check_read_only(s["sql"], self.dialect)
         except UnsafeSQLError as e:
             return self._fail(s, str(e))
+        if self.answer_checks:
+            same = self_comparisons(sql, self.dialect)
+            if same:  # always true: the database accepts it and the join multiplies every row
+                keys = join_keys(self.db, tables_in(sql, self.dialect)) if self.db is not None else ""
+                return self._fail(s, f"The condition {same[0]} compares a column with itself, so it is always "
+                                     "true. Join the two tables on their key columns"
+                                  + (f": {keys}." if keys else "."))
         if self.db is None:
             return {"sql": sql, "executed": False}
         try:
@@ -726,11 +772,21 @@ class SQLAgent:
         ok = {"sql": sql, "result": res, "executed": True}
         if s.get("attempts", 0) >= self.max_attempts:
             return ok
+        prev = (s.get("fallback") or {}).get("sql")
+        if prev and _norm_sql(prev) == _norm_sql(sql):  # the model stands by its query: accept it
+            return ok
         problem = None
         if self.answer_checks:
             seen = s.get("checked") or []
-            problem = next(((k, m) for k, m in result_problems(s["question"], sql, res.columns, res.rows)
-                            if k not in seen), None)
+            if "values" not in seen:  # a text filter on a value the column never holds
+                missing = missing_values(self.db, sql, self.dialect)
+                if missing:
+                    problem = ("values", "A filter value does not exist in the database: " + " | ".join(missing)
+                               + ". Use the stored value that means the same thing (a code, an abbreviation, "
+                               "another spelling). If none fits, return the same query unchanged.")
+            if problem is None:
+                problem = next(((k, m) for k, m in result_problems(s["question"], sql, res.columns, res.rows)
+                                if k not in seen), None)
         if problem is None and self.review and not s.get("reviewed"):
             reply = self._review.invoke({"question": s["question"], "sql": sql, "n_rows": len(res.rows),
                                          "table": rows_as_text(res.columns, res.rows, limit=5)})
@@ -814,16 +870,21 @@ class SQLAgent:
         if self.sql_candidates > 1 and self.db is not None:
             shots = list(examples or [])
             for i in range(1, self.sql_candidates):
+                hints = [base.get("hint"), CANDIDATE_HINTS[(i - 1) % len(CANDIDATE_HINTS)]]
+                if self.independent_plans:  # one misreading must not carry into every candidate
+                    hints.append(INDEPENDENT_HINT)
                 variant = {
                     **base,
-                    "mapping": states[0].get("mapping", ""),
-                    "hint": " ".join(filter(None, [base.get("hint"), CANDIDATE_HINTS[(i - 1) % len(CANDIDATE_HINTS)]])),
+                    "mapping": "" if self.independent_plans else states[0].get("mapping", ""),
+                    "hint": " ".join(filter(None, hints)),
                     # different example order/subset per candidate (MCS-SQL)
                     "examples": shots[i % len(shots):] + shots[: i % len(shots)] if shots else [],
                 }
                 states.append(_settle(self._graph.invoke(variant, limit)))
         state = vote(states)
-        return self._result(question, state, candidates, len(states))
+        result = self._result(question, state, candidates, len(states))
+        result.alternatives = [st.get("sql", "") for st in states if st.get("executed") and not st.get("error")]
+        return result
 
     def _with_patterns(self, question: str, context: str) -> str:
         """Append the SQL techniques that fit the question, with worked examples."""
@@ -886,6 +947,84 @@ class SQLAgent:
         yield from self._summary.stream(self.summary_inputs(r))
 
 
+def _trim_notes(notes: str, room: int, question: str) -> str:
+    """Column notes cut to ``room`` characters, keeping the lines about the question's words first."""
+    lines = notes.splitlines()
+    head, body = lines[0], [ln for ln in lines[1:] if ln.strip() != "*/"]
+    words = set(re.findall(r"[a-z0-9]{3,}", question.lower()))
+    body.sort(key=lambda ln: -len(words & set(re.findall(r"[a-z0-9]{3,}", ln.lower()))))
+    kept, used = [head], len(head) + 40
+    for ln in body:
+        if used + len(ln) + 1 > room:
+            break
+        kept.append(ln)
+        used += len(ln) + 1
+    return "\n".join(kept + [f"... {len(body) - len(kept) + 1} more column notes not shown */"]) if len(kept) > 1 else ""
+
+
+_TOP_ONE = {
+    "oracle": "ORDER BY ... FETCH FIRST 1 ROWS ONLY (Oracle 12c+; no LIMIT in Oracle)",
+    "tsql": "SELECT TOP 1 ... ORDER BY ... (SQL Server has no LIMIT)",
+    "teradata": "SELECT TOP 1 ... ORDER BY ...",
+}
+
+
+def top_one(dialect: str) -> str:
+    """How this dialect returns only the first row of an ordered result."""
+    return _TOP_ONE.get(dialect, "ORDER BY ... LIMIT 1")
+
+
+def build_schema(parts: dict[str, dict[str, str]], ranked: list[str], budget: int,
+                 total: int | None = None, question: str = "") -> tuple[str, dict[str, str]]:
+    """The schema text for the prompt, within ``budget`` characters, and what each table got.
+
+    Every chosen table is named with its keys and joins first, so a table the query needs is
+    never dropped because an earlier one was wide (BIRD card_games: ``cards`` with its sample
+    rows filled the whole budget and ``legalities`` was left out). Then, most relevant first:
+    the full CREATE TABLE (else the one-line column list), then sample rows, then column notes.
+    """
+    level = {n: "keys" for n in ranked}
+    used = sum(len(parts[n]["keys"]) + 2 for n in ranked)
+    if ranked:  # the most relevant table always gets its full definition
+        level[ranked[0]] = "ddl"
+        used += len(parts[ranked[0]]["ddl"]) - len(parts[ranked[0]]["keys"])
+    for upgrade, field_ in (("columns", "compact"), ("ddl", "ddl")):
+        for n in ranked:
+            if level[n] == "ddl":
+                continue
+            cost = len(parts[n][field_]) - len(parts[n]["keys" if level[n] == "keys" else "compact"])
+            if used + cost <= budget:
+                level[n] = upgrade
+                used += cost
+    extras: dict[str, list[str]] = {n: [] for n in ranked}
+    texts: dict[tuple[str, str], str] = {}
+    for field_ in ("notes", "sample"):  # descriptions say what columns mean: before sample rows
+        for n in ranked:
+            text_ = parts[n][field_]
+            if level[n] != "ddl" or not text_:
+                continue
+            if used + len(text_) + 2 > budget and field_ == "notes":
+                text_ = _trim_notes(text_, budget - used - 2, question) if budget - used > 300 else ""
+            if text_ and used + len(text_) + 2 <= budget:
+                extras[n].append(field_)
+                texts[(n, field_)] = text_
+                used += len(text_) + 2
+    blocks = []
+    for n in ranked:
+        body = parts[n][{"keys": "keys", "columns": "compact", "ddl": "ddl"}[level[n]]]
+        blocks.append("\n\n".join([body] + [texts[(n, f)] for f in extras[n]]))
+    text = "\n\n".join(blocks)
+    short = [n for n in ranked if level[n] != "ddl"]
+    if short:
+        text += ("\n\n-- Tables shown as one line (-- name(columns)) have no column types or sample rows "
+                 "here; their column names and joins are exact.")
+    hidden = (total or len(ranked)) - len(ranked)
+    if hidden > 0:
+        text += f"\n\n-- {hidden} more tables not shown. Ask about them by name to include them."
+    report = {n: "+".join([level[n]] + extras[n]) for n in ranked}
+    return text, report
+
+
 def rerank_by_fit(
     catalog, question: str, candidates: list[str], values_for=None, scores: dict | None = None
 ) -> tuple[list[str], dict[str, str]]:
@@ -922,12 +1061,19 @@ ALL_INFO_HINT = "The question asks for all the information: SELECT * FROM that o
 
 # Different instructions per extra candidate, so a temperature-0 model writes
 # genuinely different queries (CHASE-SQL uses several generator styles the same way).
+INDEPENDENT_HINT = ("Read the question again from the start as if for the first time: decide which entity "
+                    "one result row is about before choosing tables.")
+
 CANDIDATE_HINTS = (
     "Write it with explicit JOINs; avoid nested subqueries where a JOIN works.",
     "Write it step by step with CTEs (WITH ...), one CTE per intermediate result.",
     "Before writing, re-check which table each column belongs to and the exact filter values.",
     "Prefer a simple query: no extra columns, no extra joins, only what the question asks for.",
 )
+
+
+def _norm_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip().rstrip(";").lower()
 
 
 def _settle(state: dict) -> dict:

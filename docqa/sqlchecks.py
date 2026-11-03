@@ -22,22 +22,28 @@ import re
 
 from langchain_core.prompts import ChatPromptTemplate
 
-_EXPLAIN = {"sqlite": "EXPLAIN QUERY PLAN ", "postgres": "EXPLAIN ", "postgresql": "EXPLAIN ",
-            "mysql": "EXPLAIN ", "mariadb": "EXPLAIN ", "duckdb": "EXPLAIN "}
+_EXPLAIN = {"sqlite": "EXPLAIN QUERY PLAN {sql}", "postgresql": "EXPLAIN {sql}", "mysql": "EXPLAIN {sql}",
+            "mariadb": "EXPLAIN {sql}", "duckdb": "EXPLAIN {sql}",
+            # Oracle's EXPLAIN PLAN writes to PLAN_TABLE (a read-only user may not have one); an
+            # empty wrapped query makes Oracle resolve every name without fetching a row
+            "oracle": "SELECT * FROM ({sql}) q WHERE 1 = 0"}
 
 
 def dry_run(db, sql: str) -> None:
-    """``EXPLAIN`` the query on a read-only connection; raises the database's error.
+    """Check names and syntax on the database without running the query; raises its error.
 
-    Databases without a plain ``EXPLAIN`` (Oracle, SQL Server) are skipped: the query
-    itself still runs under the same checks.
+    ``EXPLAIN`` where the database has a read-only one; on Oracle the query wrapped in
+    ``WHERE 1 = 0``. SQL Server (a CTE cannot be wrapped) is skipped: the query itself
+    still runs under the same checks.
     """
-    prefix = _EXPLAIN.get(db._engine.dialect.name)
-    if not prefix:
+    template = _EXPLAIN.get(db._engine.dialect.name)
+    if not template:
         return
     with db._engine.connect() as conn:
         try:
-            conn.execution_options(no_parameters=True).exec_driver_sql(prefix + sql).fetchall()
+            res = conn.execution_options(no_parameters=True).exec_driver_sql(template.format(sql=sql))
+            if res.returns_rows:
+                res.fetchall()
         finally:
             conn.rollback()
 
@@ -153,3 +159,150 @@ def manual_query(error: str, sql: str) -> str:
         return ""
     funcs = sorted({f.upper() for f in re.findall(r"\b([A-Za-z_]+)\s*\(", sql)} - {"SELECT", "IN", "EXISTS"})
     return f"{error.splitlines()[0][:200]} {' '.join(funcs[:6])}".strip()
+
+
+# ------------------------------------------------------------------ mistakes the database accepts
+
+
+def _parse(sql: str, dialect: str):
+    import sqlglot
+
+    try:
+        return sqlglot.parse_one(sql, read=dialect)
+    except Exception:
+        return None
+
+
+def _alias_map(tree) -> dict[str, str]:
+    from sqlglot import exp
+
+    out = {}
+    for t in tree.find_all(exp.Table):
+        out[(t.alias_or_name or "").lower()] = t.name
+        out[t.name.lower()] = t.name
+    return out
+
+
+def self_comparisons(sql: str, dialect: str) -> list[str]:
+    """Conditions that compare a column with itself (``ON st.setCode = st.setCode``): always true,
+    so the database runs them happily and the join multiplies every row."""
+    from sqlglot import exp
+
+    tree = _parse(sql, dialect)
+    if tree is None:
+        return []
+    found = []
+    for eq in tree.find_all(exp.EQ):
+        a, b = eq.left, eq.right
+        if isinstance(a, exp.Column) and isinstance(b, exp.Column) \
+                and a.name.lower() == b.name.lower() and (a.table or "").lower() == (b.table or "").lower():
+            found.append(eq.sql(dialect=dialect))
+    return found
+
+
+def join_keys(db, tables: list[str]) -> str:
+    """How these tables join: foreign keys, else columns with the same name in two tables."""
+    md = db._metadata.tables
+    lines = []
+    for t in tables:
+        if t not in md:
+            continue
+        for fk in md[t].foreign_keys:
+            if fk.column.table.name in tables:
+                lines.append(f"{t}.{fk.parent.name} = {fk.column.table.name}.{fk.column.name}")
+    if not lines:
+        for i, a in enumerate(tables):
+            for b in tables[i + 1:]:
+                if a in md and b in md:
+                    shared = {c.name for c in md[a].columns} & {c.name for c in md[b].columns}
+                    lines += [f"{a}.{c} = {b}.{c}" for c in sorted(shared)]
+    return "; ".join(dict.fromkeys(lines))
+
+
+def tables_in(sql: str, dialect: str) -> list[str]:
+    from sqlglot import exp
+
+    tree = _parse(sql, dialect)
+    return list(dict.fromkeys(t.name for t in tree.find_all(exp.Table))) if tree is not None else []
+
+
+_NOT_CATEGORY = re.compile(r"^\s*[-+]?\d[\d.,:\- /T]*\s*$")  # numbers and dates are not codes
+
+
+def missing_values(db, sql: str, dialect: str, max_values: int = 40, timeout: float = 5.0) -> list[str]:
+    """For ``column = 'text'`` filters whose text never occurs in that column, a line naming the
+    values that do (all of them when there are few, else the closest ones).
+
+    'Slovakia' in a column that stores 'SVK' runs fine and returns nothing (or NULL);
+    the model can map the name to the code once it sees the codes."""
+    import difflib
+
+    from sqlalchemy import text
+    from sqlglot import exp
+
+    tree = _parse(sql, dialect)
+    if tree is None:
+        return []
+    aliases = _alias_map(tree)
+    tables = [t for t in dict.fromkeys(aliases.values())]
+    md = db._metadata.tables
+    checks = []
+    for node in tree.find_all(exp.EQ, exp.In):
+        if isinstance(node, exp.EQ):
+            col, lits = node.left, [node.right]
+            if isinstance(lits[0], exp.Column) and isinstance(col, exp.Literal):
+                col, lits = lits[0], [col]
+        else:
+            col, lits = node.this, node.expressions
+        if not isinstance(col, exp.Column):
+            continue
+        lits = [lit.this for lit in lits if isinstance(lit, exp.Literal) and lit.is_string
+                and not _NOT_CATEGORY.match(lit.this)]
+        if not lits:
+            continue
+        table = aliases.get((col.table or "").lower()) if col.table else None
+        if table is None:
+            owners = [t for t in tables if t in md and col.name in md[t].columns]
+            table = owners[0] if len(owners) == 1 else None
+        if table is None or table not in md or col.name not in md[table].columns:
+            continue
+        checks.append((table, md[table].columns[col.name].name, lits))
+    from .sqlhints import _guard
+    import time
+
+    q = db._engine.dialect.identifier_preparer.quote
+    out = []
+    with db._engine.connect() as conn:
+        _guard(conn, time.monotonic() + timeout)
+        try:
+            for table, column, lits in checks:
+                t, c = q(table), q(column)
+                for lit in lits:
+                    hit = conn.execute(text(f"SELECT 1 FROM {t} WHERE {c} = :v LIMIT 1"), {"v": lit}).first()
+                    if hit:
+                        continue
+                    values = [r[0] for r in conn.execute(
+                        text(f"SELECT DISTINCT {c} FROM {t} WHERE {c} IS NOT NULL LIMIT 2000")).fetchall()]
+                    if not values:
+                        continue
+                    shown = [str(v) for v in values]
+                    if len(shown) > max_values:
+                        lower = {s.lower(): s for s in shown}
+                        close = difflib.get_close_matches(lit.lower(), list(lower), 8, 0.5)
+                        shown = [lower[x] for x in close] + [s for s in shown if lit.lower() in s.lower()][:8]
+                        shown = list(dict.fromkeys(shown))
+                        if not shown:
+                            continue  # many values and none close: a lookup will not help
+                        label = "values like it"
+                    else:
+                        label = "its values"
+                    out.append(f"'{lit}' never occurs in {table}.{column}; {label}: "
+                               + ", ".join(f"'{s}'" for s in shown[:max_values]))
+        except Exception as e:  # never let a lookup break the loop (timeouts, odd types)
+            import logging
+
+            logging.getLogger(__name__).debug("value check failed: %s", e)
+        finally:
+            _guard(conn, None)
+            conn.rollback()
+    return out

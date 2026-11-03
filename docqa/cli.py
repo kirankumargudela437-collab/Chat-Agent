@@ -214,7 +214,21 @@ def cmd_eval(args) -> int:
     s = _settings(args)
     split = locate(args.name, Path(args.data or f"./benchmarks/{args.name}"), args.questions)
     s.database_dir = split.db_root
-    examples = pick(split.load(), args.limit, args.seed, args.only_db)
+    from .benchmark import read_ids
+
+    every = split.load()
+    if args.ids:  # a frozen question set: exactly these, in this order
+        wanted = read_ids(args.ids)
+        by_id = {e.id: e for e in every}
+        examples = [by_id[i] for i in wanted if i in by_id]
+    else:
+        if args.exclude_ids:  # e.g. keep the regression questions out of an unseen set
+            skip = set(read_ids(args.exclude_ids))
+            every = [e for e in every if e.id not in skip]
+        examples = pick(every, args.limit, args.seed, args.only_db)
+    if args.save_ids:
+        Path(args.save_ids).write_text("\n".join(e.id for e in examples) + "\n", encoding="utf-8")
+        print(f"Saved {len(examples)} question ids to {args.save_ids}")
     if not examples:
         raise ValueError("No questions selected.")
     routing = not args.oracle_db
@@ -259,6 +273,7 @@ def cmd_eval(args) -> int:
             route_choices=args.route_choices or s.sql_route_choices,
             answer_checks=s.sql_answer_checks and not args.no_checks,
             review=s.sql_review or args.review,
+            independent_plans=s.sql_independent_plans or args.independent,
         )
         bank = None
         if args.shots:
@@ -297,7 +312,7 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'docs_full': args.docs_full, 'checks': s.sql_answer_checks and not args.no_checks, 'review': s.sql_review or args.review, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'docs_full': args.docs_full, 'checks': s.sql_answer_checks and not args.no_checks, 'review': s.sql_review or args.review, 'independent': s.sql_independent_plans or args.independent, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
@@ -402,6 +417,11 @@ def build_parser() -> argparse.ArgumentParser:
                     "technique on every question (the round 5b behaviour)")
     ev.add_argument("--no-checks", action="store_true", help="don't EXPLAIN first or re-ask on suspicious results "
                     "(empty, all NULL, duplicated rows, percentage outside 0-100)")
+    ev.add_argument("--independent", action="store_true", help="with --sql-candidates N: each extra candidate "
+                    "plans the question afresh; the results show how often any candidate was right")
+    ev.add_argument("--ids", help="a file of question ids (one per line, or a JSON list): run exactly these")
+    ev.add_argument("--exclude-ids", help="leave these question ids out before sampling (e.g. the regression set)")
+    ev.add_argument("--save-ids", help="write the ids of the selected questions to this file (freeze a set)")
     ev.add_argument("--review", action="store_true", help="the model reviews its own query and first rows and "
                     "rewrites it once if it says WRONG (one more model call per question)")
     ev.add_argument("--no-patterns", action="store_true", help="don't show worked examples of SQL techniques")

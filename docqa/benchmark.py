@@ -198,6 +198,14 @@ def locate(benchmark: str, data_dir: Path, questions: str = "dev.json") -> Split
     )
 
 
+def read_ids(path) -> list[str]:
+    """Question ids from a file: a JSON list, or one id per line (# comments allowed)."""
+    text = Path(path).read_text(encoding="utf-8").strip()
+    if text.startswith("["):
+        return [str(i) for i in json.loads(text)]
+    return [ln.split("#", 1)[0].strip() for ln in text.splitlines() if ln.split("#", 1)[0].strip()]
+
+
 def pick(examples: list[Example], limit: int | None, seed: int = 0, db: str | None = None) -> list[Example]:
     """A reproducible sample. Dev files are sorted by database, so the first N would test one or two."""
     if db:
@@ -382,6 +390,8 @@ class Outcome:
     difficulty: str = ""
     seconds: float = 0.0
     margin: float | None = None  # route-only: schema-fit lead of #1 over #2
+    alt_correct: list[bool] = field(default_factory=list)  # each SQL candidate that ran: right or not
+    schema: dict = field(default_factory=dict)  # table -> what reached the prompt (keys/columns/ddl+notes+sample)
 
 
 def evaluate(
@@ -418,6 +428,14 @@ def evaluate(
             r = agent.run(question, context="", database=ex.db_id if oracle_db else None, examples=shown,
                           context_fn=docs.for_database if docs else None)
             out.pred_sql, out.attempts, out.routed_db, out.candidates = r.sql, r.attempts, r.database, r.candidates
+            out.schema = dict(getattr(agent, "last_schema", {}) or {})
+            if len(r.alternatives) > 1 and r.database == ex.db_id:
+                order = has_top_level_order_by(ex.gold_sql)
+                for alt in r.alternatives:
+                    try:
+                        out.alt_correct.append(results_match(gold, execute(path, alt, timeout), split.benchmark, order))
+                    except Exception:
+                        out.alt_correct.append(False)
             if r.error:
                 out.error = r.error
             elif r.database == ex.db_id:
@@ -597,6 +615,16 @@ def summarize(outcomes: list[Outcome], route_only_mode: bool = False, routed: bo
         lines.append("By difficulty: " + ", ".join(
             f"{lv} {_pct(sum(o.correct for o in scored if o.difficulty == lv), sum(o.difficulty == lv for o in scored))}"
             for lv in levels))
+    multi = [o for o in scored if len(o.alt_correct) > 1]
+    if multi and not route_only_mode:
+        some = [o for o in multi if any(o.alt_correct)]
+        lines.append(f"Several candidates: some candidate right {_pct(len(some), len(multi))}; "
+                     f"the agent picked a right one {_pct(sum(o.correct for o in some), len(some))} of those times")
+    shaped = [o for o in scored if o.schema]
+    if shaped and not route_only_mode:
+        short = sum(any(not v.startswith("ddl") for v in o.schema.values()) for o in shaped)
+        lines.append(f"Schema: some tables shown as one line in {short} of {len(shaped)} questions; "
+                     "per-question table detail is in the results file (\"schema\")")
     skipped = len(outcomes) - n
     if skipped:
         lines.append(f"Skipped {skipped} question(s) whose gold query failed or timed out.")

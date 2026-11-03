@@ -388,6 +388,31 @@ the first query is kept. `DOCQA_SQL_REVIEW=1` (`--review`) adds a self-review: t
 query and first rows and answers OK or WRONG with a reason. Turn the checks off with
 `DOCQA_SQL_CHECKS=0` (`--no-checks`).
 
+**What the model sees (round 7).** With BIRD's column descriptions attached, one wide table
+(card_games `cards`, 14,438 characters) filled the 12,000-character schema budget and the other
+five tables were never shown; 3 of the 10 misses of the best run needed a hidden table. The schema
+is now built in layers: every chosen table is named with its primary key and joins first, then its
+CREATE TABLE (or a one-line column list), then column notes (trimmed to the lines about the
+question) and sample rows, most relevant table first. Each result row of `docqa eval` records what
+every table got (`"schema"`), and the summary counts questions where a table was shortened.
+In chat, with one document folder per database, the documents are now fetched for the chosen
+database after routing, as in the eval.
+
+Two mistakes the database accepts are now caught: a condition that compares a column with itself
+(`ON st.setCode = st.setCode`) is sent back with the real join keys, and a text filter on a value
+the column never holds (`Country = 'Slovakia'` where the column stores `SVK`) is sent back with the
+stored values. The planning step now states what one result row is about, the measure, grouping,
+denominator and tie rule ("the score of the oldest player" is one player's score, not a MAX over
+everyone). `--sql-candidates N --independent` plans each candidate afresh, and the summary shows
+how often any candidate was right and how often the agent picked it. The "first row" rule follows
+the dialect (Oracle `FETCH FIRST 1 ROWS ONLY`, SQL Server `TOP 1`), Oracle queries are checked
+with an empty wrapped query (`WHERE 1 = 0`) before they run, and `DOCQA_SCHEMA_TTL` re-reads a
+changing schema during a chat.
+
+For a fair comparison, freeze question sets: `--save-ids` writes the chosen ids, `--ids` runs
+exactly those, and `--exclude-ids` keeps the regression questions out of an unseen set:
+`docqa eval bird --exclude-ids regression30.txt --limit 60 --seed 1 --save-ids unseen60.txt`.
+
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
 tells you to download in a browser and pass `--zip`. The schema indexer built `PRAGMA table_info('{t}')`

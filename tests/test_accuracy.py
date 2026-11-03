@@ -582,3 +582,125 @@ def test_review_rewrites_once_when_the_model_says_wrong(tmp_path):
                      sql_patterns=False, review=True)
     r = agent.run("List the names")
     assert r.columns == ["name"] and r.attempts == 2
+
+
+def test_schema_budget_names_every_table_before_details(tmp_path):
+    """BIRD card_games: the wide ``cards`` table with its notes filled the budget and
+    ``legalities`` never reached the model."""
+    db_path = tmp_path / "cards.db"
+    con = sqlite3.connect(db_path)
+    cols = ", ".join(f"c{i} TEXT" for i in range(60))
+    con.executescript(f"""
+        CREATE TABLE cards (id INTEGER PRIMARY KEY, uuid TEXT UNIQUE, name TEXT, {cols});
+        CREATE TABLE legalities (id INTEGER PRIMARY KEY, uuid TEXT REFERENCES cards(uuid), format TEXT, status TEXT);
+        CREATE TABLE sets (id INTEGER PRIMARY KEY, code TEXT, name TEXT);
+        INSERT INTO cards (id, uuid, name) VALUES (1, 'u1', 'Ancestor');
+        INSERT INTO legalities VALUES (1, 'u1', 'vintage', 'Banned');
+    """)
+    con.commit(); con.close()
+    db = open_database(f"sqlite:///{db_path}")
+    db.notes["cards"] = "\n".join(f"c{i}: a long description of column c{i} " + "x" * 120 for i in range(60))
+    agent = SQLAgent(FakeListChatModel(responses=[]), db, schema_chars=6000, sql_patterns=False)
+    text = agent.schema_text("", "Which cards are banned in vintage format?")
+    assert "legalities" in text and "sets" in text
+    assert "status" in text and "format" in text  # the needed table's columns, not just its name
+    assert len(text) < 6600
+    assert agent.last_schema["legalities"].startswith(("ddl", "columns"))
+    assert "more column notes not shown" in text  # long notes are trimmed, tables are not dropped
+
+
+def test_self_join_and_missing_value_are_sent_back(tmp_path):
+    db_path = tmp_path / "gas.db"
+    con = sqlite3.connect(db_path)
+    con.executescript("""
+        CREATE TABLE gasstations (GasStationID INTEGER PRIMARY KEY, Country TEXT, Segment TEXT);
+        CREATE TABLE transactions (TransactionID INTEGER PRIMARY KEY,
+                                   GasStationID INTEGER REFERENCES gasstations(GasStationID), Amount REAL);
+        INSERT INTO gasstations VALUES (1, 'CZE', 'Premium'), (2, 'SVK', 'Value'), (3, 'SVK', 'Premium');
+        INSERT INTO transactions VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30);
+    """)
+    con.commit(); con.close()
+    from docqa.sqlchecks import missing_values, self_comparisons
+
+    db = open_database(f"sqlite:///{db_path}")
+    assert self_comparisons("SELECT * FROM a st JOIN b s ON st.setCode = st.setCode", "sqlite") == ["st.setCode = st.setCode"]
+    assert not self_comparisons("SELECT * FROM a st JOIN b s ON st.setCode = s.code", "sqlite")
+    miss = missing_values(db, "SELECT COUNT(*) FROM gasstations g WHERE g.Country = 'Slovakia'", "sqlite")
+    assert miss and "'SVK'" in miss[0] and "'CZE'" in miss[0]
+    assert not missing_values(db, "SELECT COUNT(*) FROM gasstations WHERE Country = 'SVK'", "sqlite")
+
+    llm = FakeListChatModel(responses=[
+        "```sql\nSELECT SUM(t.Amount) FROM transactions t JOIN gasstations g ON t.GasStationID = t.GasStationID "
+        "WHERE g.Country = 'SVK'\n```",
+        "```sql\nSELECT SUM(t.Amount) FROM transactions t JOIN gasstations g ON t.GasStationID = g.GasStationID "
+        "WHERE g.Country = 'Slovakia'\n```",
+        "```sql\nSELECT SUM(t.Amount) FROM transactions t JOIN gasstations g ON t.GasStationID = g.GasStationID "
+        "WHERE g.Country = 'SVK'\n```",
+    ])
+    agent = SQLAgent(llm, db=db, schema_linking=False, value_lookup=False, sql_patterns=False, max_attempts=4)
+    r = agent.run("Total amount spent at gas stations in Slovakia?")
+    assert r.rows == [(50.0,)] and r.attempts == 3
+    errors = " ".join(e for _, e in r.failures)
+    assert "compares a column with itself" in errors and "t.GasStationID = gasstations.GasStationID" in errors.replace("transactions.", "t.")
+    assert "'SVK'" in errors
+
+
+def test_top_one_rule_follows_the_dialect():
+    from docqa.sql import GENERATE_PROMPT, top_one
+    from docqa.sqlchecks import _EXPLAIN
+
+    assert "FETCH FIRST 1 ROWS ONLY" in top_one("oracle") and "LIMIT" in top_one("sqlite")
+    assert "TOP 1" in top_one("tsql")
+    msgs = GENERATE_PROMPT.format_messages(dialect_name="Oracle", top_one=top_one("oracle"), max_rows=50, schema="",
+                                           context="", mapping="", question="q", hint="", examples=[])
+    assert "FETCH FIRST" in msgs[0].content and "LIMIT 1" not in msgs[0].content
+    assert _EXPLAIN["oracle"].format(sql="SELECT 1 FROM dual") == "SELECT * FROM (SELECT 1 FROM dual) q WHERE 1 = 0"
+
+
+def test_schema_is_read_again_after_the_ttl(tmp_path):
+    db_path = tmp_path / "live.db"
+    con = sqlite3.connect(db_path); con.execute("CREATE TABLE a (x INTEGER)"); con.commit(); con.close()
+    db = open_database(f"sqlite:///{db_path}")
+    agent = SQLAgent(FakeListChatModel(responses=[]), db, sql_patterns=False, schema_ttl=0.01)
+    assert "CREATE TABLE b" not in agent.schema_text("", "b")
+    con = sqlite3.connect(db_path); con.execute("CREATE TABLE b (y INTEGER)"); con.commit(); con.close()
+    import time as _t
+    _t.sleep(0.02)
+    assert "b" in agent.schema_text("", "b") and "y" in agent.schema_text("", "b")
+
+
+def test_independent_candidates_plan_again_and_every_candidate_is_scored(tmp_path):
+    db_path = tmp_path / "p.db"
+    con = sqlite3.connect(db_path)
+    con.executescript("CREATE TABLE p (id INTEGER, age INTEGER, score INTEGER);"
+                      "INSERT INTO p VALUES (1, 40, 75), (2, 20, 97);")
+    con.commit(); con.close()
+    calls = []
+
+    class Recorder(FakeListChatModel):
+        def _call(self, messages, *a, **k):
+            calls.append(messages[0].content if isinstance(messages, list) else str(messages))
+            return super()._call(messages, *a, **k)
+
+    llm = Recorder(responses=[
+        "plan A", "```sql\nSELECT MAX(score) FROM p\n```",
+        "plan B", "```sql\nSELECT score FROM p ORDER BY age DESC LIMIT 1\n```",
+    ])
+    agent = SQLAgent(llm, db=open_database(f"sqlite:///{db_path}"), value_lookup=False, sql_patterns=False,
+                     sql_candidates=2, independent_plans=True)
+    r = agent.run("What is the score of the oldest person?")
+    assert len(r.alternatives) == 2
+    assert sum("Answer shape" in c for c in calls) == 2  # the second candidate planned on its own
+
+
+def test_question_ids_file_and_candidate_summary(tmp_path):
+    f = tmp_path / "ids.txt"
+    f.write_text("12  # a comment\n7\n\n", encoding="utf-8")
+    assert bm.read_ids(f) == ["12", "7"]
+    f.write_text('["3", 4]', encoding="utf-8")
+    assert bm.read_ids(f) == ["3", "4"]
+    outs = [bm.Outcome("1", "d", "q", "g", correct=False, alt_correct=[False, True], routed_db="d", schema={"t": "ddl"}),
+            bm.Outcome("2", "d", "q", "g", correct=True, alt_correct=[True, False], routed_db="d", schema={"t": "keys"})]
+    text = bm.summarize(outs)
+    assert "some candidate right 100.0% (2/2)" in text and "picked a right one 50.0% (1/2)" in text
+    assert "one line in 1 of 2" in text

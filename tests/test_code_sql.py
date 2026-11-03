@@ -404,7 +404,10 @@ def test_small_database_is_shown_whole(db):
 def test_schema_text_respects_the_character_budget(legacy_db):
     agent = SQLAgent(FakeListChatModel(responses=[]), legacy_db, max_tables=33, schema_chars=600)
     text = agent.schema_text("", "users")
-    assert 0 < text.count("CREATE TABLE") < 33 and "more tables not shown" in text
+    assert 0 < text.count("CREATE TABLE") < 33
+    # no chosen table is dropped for space: the rest are named with their keys
+    assert all(f"audit_log_{i}" in text for i in range(5))
+    assert set(agent.last_schema.values()) >= {"ddl", "keys"}
 
 
 def test_table_ranking_uses_embeddings_when_available(legacy_db):
