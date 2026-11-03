@@ -212,6 +212,7 @@ class Database:
         self._engine = engine
         self.dialect = engine.dialect.name
         self.sample_rows = sample_rows
+        self.notes: dict[str, str] = {}  # table -> column descriptions, appended to its schema text
         names = inspect(engine).get_table_names() + inspect(engine).get_view_names()
         if include_tables:
             missing = set(include_tables) - set(names)
@@ -239,6 +240,8 @@ class Database:
                         info += f"\n\n/* {len(rows)} sample rows from {table.name}:\n{sample}\n*/"
                     except Exception as e:  # pragma: no cover - permissions on one table
                         log.debug("No sample rows for %s: %s", table.name, e)
+                if self.notes.get(table.name):
+                    info += f"\n\n/* Column descriptions for {table.name}:\n{self.notes[table.name]}\n*/"
                 infos[table.name] = info
             self._infos = infos
         return self._infos
@@ -408,6 +411,8 @@ class SQLResult:
     attempts: int = 0
     error: str | None = None
     failures: list[tuple[str, str]] = field(default_factory=list)  # (sql, error) of earlier attempts
+    database: str = ""  # with a database folder: the database the question was routed to
+    candidates: list[str] = field(default_factory=list)  # the databases the router considered
 
     @property
     def ok(self) -> bool:
@@ -431,13 +436,26 @@ class SQLAgent:
         embeddings=None,
         max_tables: int = 20,
         schema_chars: int = 12000,
+        catalog=None,
+        db_router: str = "llm",
+        db_candidates: int = 3,
     ):
+        """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
         self.llm = llm
+        self.catalog = catalog
+        if db_router not in ("llm", "retrieval"):
+            raise ValueError("DOCQA_DB_ROUTER must be 'llm' or 'retrieval'")
+        self.db_router = db_router
+        self.db_candidates = max(1, db_candidates)
+        self.database_name = ""
+        self._vectors_by_db: dict[str, dict[str, list[float]] | None] = {}
         self.embeddings = embeddings  # to pick the relevant tables of a big database
         self.max_tables = max_tables
         self.schema_chars = schema_chars
         self._table_vectors: dict[str, list[float]] | None = None
         self.db = db
+        if catalog is not None and db is None:
+            dialect = "sqlite"
         self.dialect = dialect or (dialect_from_url(str(db._engine.url)) if db is not None else "postgres")
         if db is not None and db.dialect == "sqlite":
             self.dialect = "sqlite"
@@ -516,6 +534,26 @@ class SQLAgent:
             parts.append(f"-- Provided by the user:\n{pasted.strip()}")
         return "\n\n".join(parts) or "(no schema given: use the table definitions in the context)"
 
+    # -- many databases -------------------------------------------------------------
+
+    def route(self, question: str) -> tuple[str, list[str]]:
+        """``(database, candidates)`` for a question, using the catalog's ranking (and the model)."""
+        candidates = [n for n, _ in self.catalog.rank(question, self.db_candidates)]
+        if self.db_router == "llm" and len(candidates) > 1:
+            return self.catalog.choose(question, candidates, self.llm), candidates
+        return candidates[0], candidates
+
+    def use_database(self, name: str) -> None:
+        """Switch to one database of the catalog (its table embeddings are kept per database)."""
+        if name == self.database_name and self.db is not None:
+            return
+        if self.database_name:
+            self._vectors_by_db[self.database_name] = self._table_vectors
+        self.db = self.catalog.open(name)
+        self.dialect = "sqlite"
+        self.database_name = name
+        self._table_vectors = self._vectors_by_db.get(name)
+
     # -- graph nodes ------------------------------------------------------------------
 
     def _base(self, s: SQLState) -> dict:
@@ -582,9 +620,24 @@ class SQLAgent:
     # -- public -----------------------------------------------------------------------
 
     def run(
-        self, question: str, context: str = "", schema: str = "", examples: list[tuple[str, str]] | None = None
+        self,
+        question: str,
+        context: str = "",
+        schema: str = "",
+        examples: list[tuple[str, str]] | None = None,
+        database: str | None = None,
     ) -> SQLResult:
-        """``examples`` are golden (question, sql) pairs, shown to the generator as earlier turns."""
+        """``examples`` are golden (question, sql) pairs, shown to the generator as earlier turns.
+
+        With a catalog, ``database`` names the database to use; otherwise it is routed.
+        """
+        candidates: list[str] = []
+        if self.catalog is not None:
+            if database:
+                name = database
+            else:
+                name, candidates = self.route(question)
+            self.use_database(name)
         state = self._graph.invoke(
             {
                 "question": question,
@@ -611,6 +664,8 @@ class SQLAgent:
             attempts=state.get("attempts", 0),
             error=error,
             failures=failures[:-1] if error else failures,
+            database=self.database_name if self.catalog is not None else "",
+            candidates=candidates,
         )
 
     def summary_inputs(self, r: SQLResult) -> dict:
@@ -646,6 +701,9 @@ def format_sql_answer(r: SQLResult, summary: str = "") -> str:
     parts = []
     if summary:
         parts.append(summary)
+    if r.database:
+        others = [c for c in r.candidates if c != r.database]
+        parts.append(f"Database: **{r.database}**" + (f" (also considered: {', '.join(others)})" if others else ""))
     if r.mapping:
         parts.append("**How the question maps to your schema**\n" + r.mapping)
     if r.sql:

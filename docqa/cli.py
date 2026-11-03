@@ -1,4 +1,4 @@
-"""Command line: ``docqa sync | watch | ask | chat | describe-db | sample | ui``."""
+"""Command line: ``docqa sync | watch | ask | chat | describe-db | sample | ui | get-benchmark | eval``."""
 
 from __future__ import annotations
 
@@ -34,6 +34,9 @@ def _settings(args: argparse.Namespace) -> Settings:
 
         s.database_url = args.db
         s.sql_dialect = dialect_from_url(args.db)
+    if getattr(args, "db_dir", None):
+        s.database_dir = Path(args.db_dir)
+        s.sql_dialect = "sqlite"
     return s
 
 
@@ -121,6 +124,9 @@ def cmd_chat(args) -> int:
         print(sync_documents(s).summary())
     agent = build_agent(s, schema=_schema(args))
     db = f" and {s.database_url.split('@')[-1]}" if s.database_url else ""
+    if s.database_dir is not None:
+        n = len(agent.sql_agent.catalog)
+        db = f" and {n} databases in {s.database_dir} (each question goes to the best match)"
     print(f"Chatting with {s.llm_provider}:{s.llm_model} over {s.docs_dir}{db}.")
     print(
         "Commands: /sql, /code or /doc before a question forces that route; /run <SQL> runs your own "
@@ -191,6 +197,86 @@ def cmd_describe_db(args) -> int:
     return 0
 
 
+def cmd_get_benchmark(args) -> int:
+    from .benchmark import get_benchmark
+
+    get_benchmark(args.name, Path(args.dest), Path(args.zip) if args.zip else None)
+    print(f"Next: docqa eval {args.name} --limit 50")
+    return 0
+
+
+def cmd_eval(args) -> int:
+    import json
+
+    from . import open_catalog
+    from .benchmark import evaluate, locate, pick, read_results, route_only, summarize, write_result
+
+    s = _settings(args)
+    split = locate(args.name, Path(args.data or f"./benchmarks/{args.name}"), args.questions)
+    s.database_dir = split.db_root
+    examples = pick(split.load(), args.limit, args.seed, args.only_db)
+    if not examples:
+        raise ValueError("No questions selected.")
+    routing = not args.oracle_db
+    catalog = open_catalog(s, use_embeddings=routing and not args.no_embeddings)
+    k = args.candidates or s.sql_db_candidates
+    mode = "route-only" if args.route_only else ("oracle-db" if args.oracle_db else "routed")
+    print(
+        f"{args.name} {split.questions_file.name}: {len(examples)} questions, {len(catalog)} databases in "
+        f"{split.db_root}, mode {mode}" + (f", router {args.router or s.sql_db_router}, top {k}" if routing else "")
+    )
+    if args.resume:
+        out = Path(args.resume)
+        done = read_results(out)
+        print(f"Resuming {out}: {len(done)} questions already done")
+    else:
+        out = s.data_dir / "eval" / f"{args.name}-{split.questions_file.stem}-{mode}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+        done = {}
+    if args.route_only:
+        outcomes = route_only(catalog, examples, k)
+    else:
+        from .providers import make_llm
+        from .sql import SQLAgent
+
+        print(f"Model: {s.llm_provider}:{s.llm_model}" + ("" if args.no_embeddings or not routing else
+                                                           f", embeddings {s.embed_provider}:{s.embed_model}"))
+        agent = SQLAgent(
+            make_llm(s),
+            catalog=catalog,
+            max_attempts=s.sql_max_attempts,
+            max_rows=1000,  # the benchmark compares full results; don't nudge the model to LIMIT 50
+            schema_linking=s.sql_schema_linking and not args.no_linking,
+            embeddings=catalog.embeddings,
+            max_tables=s.sql_max_tables,
+            schema_chars=s.sql_schema_chars,
+            db_router=args.router or s.sql_db_router,
+            db_candidates=k,
+        )
+        outcomes = evaluate(agent, split, examples, args.oracle_db, args.timeout, done)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    results = []
+    with open(out, "a" if args.resume else "w", encoding="utf-8") as fh:
+        for i, o in enumerate(outcomes, 1):
+            if o.id not in done:
+                write_result(fh, o)
+            results.append(o)
+            mark = "skip" if o.gold_error else ("ok  " if o.correct else "miss")
+            where = f"{o.db_id}" + (f" -> {o.routed_db}" if o.routed_db and o.routed_db != o.db_id else "")
+            note = f"  ({o.error[:80]})" if o.error else ""
+            print(f"[{i}/{len(examples)}] {mark} {where} {o.seconds:.1f}s{note}", flush=True)
+    text = summarize(results, args.route_only, routing)
+    print("\n" + text)
+    summary = out.with_suffix(".summary.txt")
+    summary.write_text(
+        f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'limit': args.limit, 'seed': args.seed})}\n"
+        + text + "\n",
+        encoding="utf-8",
+    )
+    print(f"\nPer-question results: {out}\nSummary: {summary}")
+    return 0
+
+
 def cmd_sample(args) -> int:
     from .sample import create_sample_workspace
 
@@ -223,6 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--env-file", default=".env", help="settings file (default: .env)")
     p.add_argument("--docs", type=Path, help="override DOCQA_DOCS_DIR")
     p.add_argument("--db", help="override DOCQA_DATABASE_URL, e.g. sqlite:///my_company.db")
+    p.add_argument("--db-dir", help="override DOCQA_DATABASE_DIR: a folder of SQLite files, one picked per question")
     p.add_argument("--dialect", help="SQL dialect when no database is connected: postgres, mysql, tsql, snowflake, bigquery, oracle, sqlite ...")
     p.add_argument("--schema", help="file with CREATE TABLE statements or a table/column list to write SQL against")
     p.add_argument("-v", "--verbose", action="store_true", help="show rewritten follow-up queries and failed SQL attempts")
@@ -251,6 +338,29 @@ def build_parser() -> argparse.ArgumentParser:
     dd.add_argument("--out", help="output file (default: <docs>/data_dictionary_draft.md)")
     dd.add_argument("--force", action="store_true", help="overwrite an existing draft")
     dd.set_defaults(func=cmd_describe_db)
+
+    gb = sub.add_parser("get-benchmark", help="download Spider or BIRD (dev) from the official source into ./benchmarks")
+    gb.add_argument("name", choices=["spider", "bird"])
+    gb.add_argument("--dest", default="./benchmarks", help="folder to unpack into (default: ./benchmarks)")
+    gb.add_argument("--zip", help="use a zip you downloaded yourself instead of downloading")
+    gb.set_defaults(func=cmd_get_benchmark)
+
+    ev = sub.add_parser("eval", help="run a benchmark's dev questions and report execution accuracy")
+    ev.add_argument("name", choices=["spider", "bird"])
+    ev.add_argument("--data", help="unpacked benchmark folder (default: ./benchmarks/<name>)")
+    ev.add_argument("--questions", default="dev.json", help="questions file inside it (default: dev.json)")
+    ev.add_argument("--limit", type=int, help="a random sample of N questions (reproducible with --seed)")
+    ev.add_argument("--seed", type=int, default=0)
+    ev.add_argument("--only-db", help="only questions about this database")
+    ev.add_argument("--oracle-db", action="store_true", help="give the agent the right database (leaderboard setting)")
+    ev.add_argument("--route-only", action="store_true", help="only test database routing; no chat model needed")
+    ev.add_argument("--router", choices=["llm", "retrieval"], help="override DOCQA_DB_ROUTER")
+    ev.add_argument("--candidates", type=int, help="databases the router considers (default DOCQA_DB_CANDIDATES=3)")
+    ev.add_argument("--no-embeddings", action="store_true", help="route with keyword search only")
+    ev.add_argument("--no-linking", action="store_true", help="skip the schema-linking call (faster, usually less accurate)")
+    ev.add_argument("--timeout", type=float, default=30.0, help="seconds per query execution")
+    ev.add_argument("--resume", help="continue a results .jsonl from an interrupted run")
+    ev.set_defaults(func=cmd_eval)
 
     sa = sub.add_parser("sample", help="create sample docs, code, SQL and a SQLite database to try the agent")
     sa.add_argument("folder", nargs="?", default="sample_workspace")

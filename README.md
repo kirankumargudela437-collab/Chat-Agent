@@ -213,6 +213,82 @@ docqa --env-file acme.env ui
 
 Each docs folder gets its own index, so organisations never see each other's documents.
 
+## Many databases: one question, the right database
+
+Point the agent at a folder of SQLite files instead of one database URL, and every
+SQL question is routed to the database that can answer it:
+
+```bash
+docqa --db-dir benchmarks/spider/spider_data/database chat
+# or DOCQA_DATABASE_DIR=... in .env; in the app, put the folder path in the database field
+```
+
+For each question the agent ranks the databases by a short card per database (name,
+tables, columns, foreign keys, a few example values, and BIRD's column descriptions
+from `database_description/*.csv`). Two rankings are fused: keyword search (BM25) over
+the cards, for exact names like `singer`, and embedding similarity, for meaning
+("vocalist" finds `singer`). The chat model then picks one of the top
+`DOCQA_DB_CANDIDATES` (3) by reading their cards side by side (`DOCQA_DB_ROUTER=llm`),
+or the top hit is used with no model call (`retrieval`). The chosen database then goes
+through the normal SQL loop, opened read-only. Answers say which database was used and
+which others were considered. Cards and embeddings are cached in the data folder and
+only rebuilt for files that change. In chat, `/run @car_1 SELECT ...` runs your own
+query on a named database.
+
+## Testing the SQL agent on Spider and BIRD
+
+Two public text-to-SQL benchmarks ship one SQLite file per database, with questions and
+verified gold SQL:
+
+| | Databases | Dev questions | What it tests | License |
+|---|---|---|---|---|
+| [Spider 1.0](https://yale-lily.github.io/spider) | 166 (20 in dev) | 1,034 | joins, nesting, grouping across 138 domains | CC BY-SA 4.0 |
+| [BIRD](https://bird-bench.github.io/) | 11 in dev (95 total) | 1,534 | big, messy real data; needs the per-question "evidence" hints and column descriptions | CC BY-SA 4.0 |
+
+Both licenses allow use with attribution (BIRD's README says it moved to CC BY-SA 4.0).
+The data is not in this repo: it downloads into `./benchmarks/`, which git ignores.
+
+```bash
+docqa get-benchmark spider        # official Google Drive file from the Spider page, ~1 GB
+docqa get-benchmark bird          # official BIRD dev.zip, unpacks the nested dev_databases.zip
+# if a download link has moved: download the zip in a browser, then
+docqa get-benchmark spider --zip ~/Downloads/spider_data.zip
+
+docqa eval spider --route-only --limit 200   # routing only, no chat model needed, seconds
+docqa eval spider --limit 50                 # route + write SQL + run it: execution accuracy
+docqa eval spider --limit 50 --oracle-db     # give it the right database (leaderboard setting)
+docqa eval bird --limit 50                   # BIRD: evidence hints are passed as context
+docqa eval spider --resume data/eval/<file>.jsonl   # continue an interrupted run
+```
+
+`eval` prints, and saves next to a per-question `.jsonl` under `data/eval/`:
+
+* **Execution accuracy**: the share of questions whose generated query returns the same
+  rows as the gold query. BIRD compares rows as sets, exactly like BIRD's own
+  `evaluation.py`; Spider compares them as multisets, in order when the gold query has a
+  top-level `ORDER BY`. (That is Spider's classic execution match, not its stricter
+  "test-suite" accuracy.) Floats are rounded to 6 places.
+* **Routing**: how often the right database was picked, and how often it was among the
+  candidates, plus accuracy when routed right, so you can tell routing misses from SQL misses.
+* Attempts, failures after retries, seconds per question, accuracy by BIRD difficulty, and
+  the databases with the most misses.
+
+`--limit N` takes a reproducible random sample (`--seed`), because dev files are sorted
+by database and the first 50 would cover one or two. Without `--oracle-db` the agent
+routes across every database in the folder (all 166 for Spider), which is harder than
+the leaderboard setting. A full Spider dev run is ~3 model calls per question; on a
+local 7B model start with `--limit 50 --no-linking` and compare.
+
+**Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
+downloader uses the Google Drive file linked from the Spider page and, if that moves,
+tells you to download in a browser and pass `--zip`. The schema indexer built `PRAGMA table_info('{t}')`
+with string formatting, which breaks on a quote in a table name; here identifiers are
+quoted. One whole-database document per schema in Chroma with top-1 retrieval has no
+keyword half and no second look at close candidates. The Streamlit script had its prompt,
+session state and chat loop outside the code (broken indentation and a stray fence), never
+ran the query, and could not tell a right answer from a wrong one. Routing lives in the
+existing agent, CLI and app instead of a second app.
+
 ## Writing documents the SQL route can use
 
 Plain sentences work. Three patterns help most:
@@ -295,7 +371,8 @@ Ollama's own default is small and it drops overflowing text without an error.
 
 * Generated SQL is checked and run read-only, but read the query before you reuse it
   elsewhere: a valid query can still answer a slightly different question.
-* Statement timeouts are not set; a very heavy query runs until the database stops it.
+* Statement timeouts are not set in chat; a very heavy query runs until the database stops it.
+  (`docqa eval` stops each benchmark query after `--timeout` seconds, 30 by default.)
 
 * Scanned PDFs have no text layer; sync warns about them. Use Docling for OCR.
 * In Docling mode citations show file and section but not page numbers.
@@ -359,5 +436,6 @@ incremental add/skip/edit/delete, persistence across runs, the empty-folder and
 failed-file guards, follow-up rewriting, grounded prompts, citation parsing, code
 splitting along functions with line numbers, golden examples, the SQL read-only
 check and read-only connection, self-healing retries against a real SQLite file,
-routing and multi-route answers, the CLI and the Streamlit app. None of them run a
+routing and multi-route answers, routing across a folder of databases, the Spider/BIRD
+loaders, row comparison rules and `eval` (on tiny fake benchmarks), the CLI and the Streamlit app. None of them run a
 real model, so try the sample questions with your model before relying on it.

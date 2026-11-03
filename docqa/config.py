@@ -58,6 +58,9 @@ class Settings:
     code_chunk_overlap: int = 150
     max_file_kb: int = 1024
     database_url: str | None = None
+    database_dir: Path | None = None  # a folder of SQLite files; each question is routed to one of them
+    sql_db_router: str = "llm"        # llm: the model picks among the top candidates; retrieval: top hit
+    sql_db_candidates: int = 3
     sql_dialect: str = ""            # used without a database; with one, taken from database_url
     sql_tables: tuple[str, ...] = ()  # limit the live schema to these tables (big databases)
     sql_max_attempts: int = 3
@@ -75,7 +78,10 @@ class Settings:
             self.extensions = supported_extensions(self.include_code, self.use_docling)
         from .sql import dialect_from_url
 
-        if self.database_url:  # a connected database decides; DOCQA_SQL_DIALECT is for when there is none
+        if self.database_dir is not None:
+            self.database_dir = Path(self.database_dir)
+            self.sql_dialect = "sqlite"
+        elif self.database_url:  # a connected database decides; DOCQA_SQL_DIALECT is for when there is none
             self.sql_dialect = dialect_from_url(self.database_url)
         elif not self.sql_dialect:
             self.sql_dialect = "postgres"
@@ -89,6 +95,9 @@ class Settings:
             raise ValueError("DOCQA_CHUNK_OVERLAP must be smaller than DOCQA_CHUNK_SIZE")
         if self.code_chunk_overlap >= self.code_chunk_size:
             raise ValueError("DOCQA_CODE_CHUNK_OVERLAP must be smaller than DOCQA_CODE_CHUNK_SIZE")
+        self.sql_db_router = self.sql_db_router.lower()
+        if self.sql_db_router not in ("llm", "retrieval"):
+            raise ValueError("DOCQA_DB_ROUTER must be 'llm' or 'retrieval'")
         if self.sql_max_attempts < 1:
             raise ValueError("DOCQA_SQL_MAX_ATTEMPTS must be at least 1")
 
@@ -114,6 +123,9 @@ class Settings:
             code_chunk_overlap=int(_env("DOCQA_CODE_CHUNK_OVERLAP", "150")),
             max_file_kb=int(_env("DOCQA_MAX_FILE_KB", "1024")),
             database_url=os.getenv("DOCQA_DATABASE_URL") or None,
+            database_dir=Path(os.environ["DOCQA_DATABASE_DIR"]) if os.getenv("DOCQA_DATABASE_DIR") else None,
+            sql_db_router=_env("DOCQA_DB_ROUTER", "llm"),
+            sql_db_candidates=int(_env("DOCQA_DB_CANDIDATES", "3")),
             sql_dialect=_env("DOCQA_SQL_DIALECT", "").lower(),
             sql_tables=tuple(t.strip() for t in _env("DOCQA_SQL_TABLES", "").split(",") if t.strip()),
             sql_max_attempts=int(_env("DOCQA_SQL_MAX_ATTEMPTS", "3")),
