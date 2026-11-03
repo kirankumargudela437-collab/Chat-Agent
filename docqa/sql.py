@@ -44,7 +44,7 @@ from typing import Any, Optional, TypedDict
 import sqlglot
 from sqlglot import exp
 
-from .sqlhints import ValueIndex, error_hint, format_value_hints
+from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import AIMessage, HumanMessage
@@ -320,7 +320,13 @@ _RULES = (
     "- Apply the business rules and definitions from the context exactly (status codes, KPI formulas, exclusions).\n"
     "- Prefer readable CTEs over nested subqueries; use window functions (ROW_NUMBER, RANK, LAG, LEAD, "
     "SUM() OVER) where they fit; guard divisions with NULLIF and handle NULLs with COALESCE.\n"
-    "- Follow the style of the golden examples when one is similar.\n"
+    "- Return exactly the columns the question asks for, in the order it asks; no extra columns.\n"
+    "- Do not add filters, conditions or joins the question does not ask for. Put parentheses around mixed AND/OR.\n"
+    "- When counting or grouping people or things, GROUP BY their key column (id), not their name: names repeat.\n"
+    "- If two tables only connect through a third (a bridge table), join through it using the foreign keys.\n"
+    "- For 'not / never / without' questions use NOT IN or EXCEPT, not != on a join.\n"
+    "- For the row with the highest / lowest / latest value ('the most recent order'), use ORDER BY ... LIMIT 1.\n"
+    "- Follow the style of the golden examples when one is similar, but use the column names of THIS schema.\n"
     "- Unless the question asks for everything, return at most {max_rows} rows.\n"
     "- Output only the SQL in one ```sql block, no explanation."
     "{hint}"
@@ -445,7 +451,7 @@ class SQLAgent:
         schema_chars: int = 12000,
         catalog=None,
         db_router: str = "llm",
-        db_candidates: int = 3,
+        db_candidates: int = 5,
         value_lookup: bool = True,
         sql_candidates: int = 1,
     ):
@@ -551,9 +557,23 @@ class SQLAgent:
     def route(self, question: str) -> tuple[str, list[str]]:
         """``(database, candidates)`` for a question, using the catalog's ranking (and the model)."""
         candidates = [n for n, _ in self.catalog.rank(question, self.db_candidates)]
-        if self.db_router == "llm" and len(candidates) > 1:
-            return self.catalog.choose(question, candidates, self.llm), candidates
+        if len(candidates) <= 1:
+            return candidates[0], candidates
+        candidates, evidence = rerank_by_fit(
+            self.catalog, question, candidates, self._values_for if self.value_lookup else None
+        )
+        if self.db_router == "llm":
+            return self.catalog.choose(question, candidates, self.llm, evidence), candidates
         return candidates[0], candidates
+
+    def _values_for(self, key: str, db):
+        if key not in self._value_indexes:
+            try:
+                self._value_indexes[key] = ValueIndex(db, time_budget=10.0)
+            except Exception as e:  # never let the lookup break a question
+                log.info("Value index failed for %s: %s", key, e)
+                self._value_indexes[key] = None
+        return self._value_indexes[key]
 
     def use_database(self, name: str) -> None:
         """Switch to one database of the catalog (its table embeddings are kept per database)."""
@@ -608,6 +628,15 @@ class SQLAgent:
             res = run_query(self.db, sql, self.max_rows)
         except Exception as e:  # the exact database error drives the next attempt
             error = _db_error(e)
+            fixed = auto_fix_identifiers(self.db, sql, self.dialect) if re.search(r"no such (column|table)", error, re.I) else None
+            if fixed and fixed != sql:  # names that differ only in case/underscores: repaired without a model call
+                try:
+                    res = run_query(self.db, fixed, self.max_rows)
+                    log.info("Repaired identifiers: %s -> %s", sql, fixed)
+                    return {"sql": fixed, "result": res, "executed": True}
+                except Exception as e2:
+                    error = _db_error(e2)
+                    sql = fixed
             hint = error_hint(self.db, sql, error, self.dialect)
             return self._fail(s, f"{error}\n{hint}" if hint else error)
         return {"sql": sql, "result": res, "executed": True}
@@ -684,14 +713,7 @@ class SQLAgent:
         """Append the database values the question mentions (CHESS-style value retrieval)."""
         if not self.value_lookup or self.db is None:
             return context
-        key = self.database_name or str(self.db._engine.url)
-        if key not in self._value_indexes:
-            try:
-                self._value_indexes[key] = ValueIndex(self.db)
-            except Exception as e:  # never let the lookup break a question
-                log.info("Value index failed for %s: %s", key, e)
-                self._value_indexes[key] = None
-        index = self._value_indexes[key]
+        index = self._values_for(self.database_name or str(self.db._engine.url), self.db)
         if not index:
             return context
         hints = format_value_hints(index.match(f"{question}\n{context}"))
@@ -735,6 +757,28 @@ class SQLAgent:
 
     def stream_summary(self, r: SQLResult):
         yield from self._summary.stream(self.summary_inputs(r))
+
+
+def rerank_by_fit(catalog, question: str, candidates: list[str], values_for=None) -> tuple[list[str], dict[str, str]]:
+    """Reorder routing candidates by how well each database's names and values cover the question.
+
+    Look-alike databases (flight_1 / flight_2 / flight_4) rank close together on
+    their cards; checking which one's table and column names and stored values the
+    question actually uses separates them. The retrieval rank still counts (a small
+    penalty per place), so a clear retrieval winner is not overturned by one word.
+    ``values_for(name, db)`` returns a ``ValueIndex`` (cached by the caller) or None.
+    """
+    fit, evidence = {}, {}
+    for n in candidates:
+        try:
+            db = catalog.open(n)
+            fit[n], evidence[n] = schema_fit(question, db, values_for(n, db) if values_for else None)
+        except Exception as e:  # an unreadable database just gets no evidence
+            log.debug("No routing evidence for %s: %s", n, e)
+            fit[n], evidence[n] = 0.0, ""
+    order = {n: i for i, n in enumerate(candidates)}
+    ranked = sorted(candidates, key=lambda n: (-(fit[n] - 0.05 * order[n]), order[n]))
+    return ranked, evidence
 
 
 # Different instructions per extra candidate, so a temperature-0 model writes

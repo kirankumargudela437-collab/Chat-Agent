@@ -233,7 +233,7 @@ def cmd_eval(args) -> int:
         out = s.data_dir / "eval" / f"{args.name}-{split.questions_file.stem}-{mode}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
         done = {}
     if args.route_only:
-        outcomes = route_only(catalog, examples, k)
+        outcomes = route_only(catalog, examples, k, fit=not args.no_fit)
     else:
         from .providers import make_llm
         from .sql import SQLAgent
@@ -366,7 +366,8 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--oracle-db", action="store_true", help="give the agent the right database (leaderboard setting)")
     ev.add_argument("--route-only", action="store_true", help="only test database routing; no chat model needed")
     ev.add_argument("--router", choices=["llm", "retrieval"], help="override DOCQA_DB_ROUTER")
-    ev.add_argument("--candidates", type=int, help="databases the router considers (default DOCQA_DB_CANDIDATES=3)")
+    ev.add_argument("--candidates", type=int, help="databases the router considers (default DOCQA_DB_CANDIDATES=5)")
+    ev.add_argument("--no-fit", action="store_true", help="route-only: rank by retrieval alone, without schema/value fit")
     ev.add_argument("--no-embeddings", action="store_true", help="route with keyword search only")
     ev.add_argument("--no-linking", action="store_true", help="skip the schema-linking call (faster, usually less accurate)")
     ev.add_argument("--timeout", type=float, default=30.0, help="seconds per query execution")

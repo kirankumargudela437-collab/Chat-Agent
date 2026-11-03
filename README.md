@@ -298,6 +298,25 @@ Each fix below comes from a published text-to-SQL agent:
 For your own database the same features apply in `chat`, `ask` and the app; your golden
 SQL file plays the role of the training set.
 
+**Round 2, from the per-question analysis of those runs.** Half of the Spider misses were
+routing (11 of 22), mostly between look-alike databases (flight_1/2/4, three "documents"
+databases); the rest were the model adding columns or filters nobody asked for, grouping
+by name instead of id, skipping a bridge table, and repeating a wrong column name even
+after the hint. So:
+
+* **Routing by fit.** The router now considers 5 candidates (`DOCQA_DB_CANDIDATES`), and
+  each is checked for which question words are its table/column names and which stored
+  values the question mentions. Candidates are reordered by that fit, and the model sees
+  it on each card ("Matches the question: names: airport, city; values:
+  airports.City='Aberdeen '"). `docqa eval spider --route-only` measures it without a chat
+  model; `--no-fit` shows retrieval alone.
+* **Automatic name repair.** When a query fails on a column or table that differs from a
+  real one only in case, underscores or spaces (`indep_year` vs `IndepYear`), or uses the
+  wrong table alias, the name is fixed and the query re-run without another model call.
+* **Stricter rules** in the SQL prompt: only the asked-for columns, no extra filters,
+  group by key not name, join through bridge tables, NOT IN / EXCEPT for negation,
+  ORDER BY ... LIMIT 1 for "the most recent", parentheses around mixed AND/OR.
+
 ```bash
 docqa eval spider --limit 50 --shots 4                    # values + error hints + 4 examples
 docqa eval spider --limit 50 --shots 4 --sql-candidates 3 # plus voting (slow on a laptop)

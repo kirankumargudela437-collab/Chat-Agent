@@ -182,3 +182,95 @@ def test_cli_eval_with_shots_and_candidates(spider, tmp_path, capsys, monkeypatc
     assert code == 0 and "Few-shot: 2 similar solved questions" in out
     summary = next((tmp_path / "data" / "eval").glob("*.summary.txt")).read_text(encoding="utf-8")
     assert '"shots": 2' in summary and '"sql_candidates": 2' in summary
+
+
+# --------------------------------------------------------------------------- round 2: identifier repair, routing fit, rules
+
+COUNTRY = """
+CREATE TABLE country (Code TEXT PRIMARY KEY, Name TEXT, IndepYear INTEGER, SurfaceArea REAL);
+CREATE TABLE city (ID INTEGER PRIMARY KEY, Name TEXT, CountryCode TEXT REFERENCES country(Code));
+INSERT INTO country VALUES ('ABW','Aruba',NULL,193.0),('AGO','Angola',1975,1246700.0);
+INSERT INTO city VALUES (1,'Luanda','AGO'),(2,'Oranjestad','ABW');
+"""
+
+
+def _country_db(tmp_path):
+    return open_database(f"sqlite:///{make_db(tmp_path / 'world.sqlite', COUNTRY).as_posix()}")
+
+
+def test_auto_fix_rewrites_case_and_underscore_variants(tmp_path):
+    from docqa.sqlhints import auto_fix_identifiers
+
+    db = _country_db(tmp_path)
+    fixed = auto_fix_identifiers(db, "SELECT name, indep_year, surface_area FROM Country WHERE indep_year > 1950")
+    assert fixed and "IndepYear" in fixed and "SurfaceArea" in fixed and "indep_year" not in fixed
+    # wrong alias: the column lives in the other table of the query
+    fixed = auto_fix_identifiers(db, "SELECT T1.Name FROM city AS T1 JOIN country AS T2 ON T1.CountryCode = T2.Code WHERE T1.SurfaceArea > 1000")
+    assert fixed and "T2.SurfaceArea" in fixed
+    # nothing to fix, or ambiguous: leave it to the model
+    assert auto_fix_identifiers(db, "SELECT Name FROM country") is None
+    assert auto_fix_identifiers(db, "SELECT population FROM country") is None
+
+
+def test_agent_repairs_names_without_a_model_call(tmp_path):
+    db = _country_db(tmp_path)
+    llm = RecordingLLM(responses=["SELECT name FROM country WHERE indep_year = 1975"], prompts=[])
+    r = SQLAgent(llm, db, schema_linking=False, value_lookup=False).run("Which country became independent in 1975?")
+    assert r.ok and r.rows == [("Angola",)] and r.attempts == 1 and len(llm.prompts) == 1
+    assert "IndepYear" in r.sql
+
+
+def test_rules_tell_the_model_not_to_embellish(tmp_path):
+    db = _country_db(tmp_path)
+    llm = RecordingLLM(responses=["SELECT 1"], prompts=[])
+    SQLAgent(llm, db, schema_linking=False, value_lookup=False).run("q?")
+    system = llm.prompts[0][0].content
+    assert "no extra columns" in system and "GROUP BY their key column" in system and "bridge table" in system
+
+
+FLIGHT_A = """
+CREATE TABLE airlines (uid INTEGER PRIMARY KEY, Airline TEXT, Country TEXT);
+CREATE TABLE airports (City TEXT, AirportCode TEXT PRIMARY KEY, AirportName TEXT);
+CREATE TABLE flights (Airline INTEGER, FlightNo INTEGER, SourceAirport TEXT, DestAirport TEXT);
+INSERT INTO airports VALUES ('Aberdeen ','APG','Phillips AAF'),('Abilene ','ABI','Municipal');
+INSERT INTO airlines VALUES (1,'United Airlines','USA');
+"""
+FLIGHT_B = """
+CREATE TABLE aircraft (aid INTEGER PRIMARY KEY, name TEXT, distance INTEGER);
+CREATE TABLE employee (eid INTEGER PRIMARY KEY, name TEXT, salary INTEGER);
+CREATE TABLE flight (flno INTEGER PRIMARY KEY, origin TEXT, destination TEXT, aid INTEGER);
+INSERT INTO flight VALUES (1,'Los Angeles','Washington D.C.',1);
+"""
+
+
+def test_rerank_prefers_the_database_that_has_the_value(tmp_path):
+    from docqa.sql import rerank_by_fit
+    from docqa.sqlhints import ValueIndex
+
+    make_db(tmp_path / "dbs" / "flight_2" / "flight_2.sqlite", FLIGHT_A)
+    make_db(tmp_path / "dbs" / "flight_1" / "flight_1.sqlite", FLIGHT_B)
+    cat = DatabaseCatalog(tmp_path / "dbs")
+    q = "How many flights depart from the airports in Aberdeen?"
+    ranked, evidence = rerank_by_fit(cat, q, ["flight_1", "flight_2"], lambda n, db: ValueIndex(db))
+    assert ranked[0] == "flight_2"
+    assert "Aberdeen" in evidence["flight_2"] and "airport" in evidence["flight_2"]
+
+
+def test_router_prompt_shows_the_evidence(tmp_path):
+    make_db(tmp_path / "dbs" / "flight_2" / "flight_2.sqlite", FLIGHT_A)
+    make_db(tmp_path / "dbs" / "flight_1" / "flight_1.sqlite", FLIGHT_B)
+    cat = DatabaseCatalog(tmp_path / "dbs")
+    llm = RecordingLLM(responses=["flight_2", "SELECT count(*) FROM airports WHERE City = 'Aberdeen '"], prompts=[])
+    agent = SQLAgent(llm, catalog=cat, schema_linking=False)
+    r = agent.run("How many airports are in Aberdeen?")
+    assert r.database == "flight_2" and r.rows == [(1,)]
+    router_prompt = llm.prompts[0][0].content
+    assert "Matches the question:" in router_prompt and "Aberdeen" in router_prompt
+
+
+def test_route_only_uses_fit(tmp_path):
+    make_db(tmp_path / "dbs" / "flight_2" / "flight_2.sqlite", FLIGHT_A)
+    make_db(tmp_path / "dbs" / "flight_1" / "flight_1.sqlite", FLIGHT_B)
+    cat = DatabaseCatalog(tmp_path / "dbs")
+    ex = bm.Example("1", "flight_2", "How many airports are in Aberdeen?", "SELECT 1")
+    assert next(bm.route_only(cat, [ex], k=2)).correct

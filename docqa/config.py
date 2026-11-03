@@ -60,7 +60,7 @@ class Settings:
     database_url: str | None = None
     database_dir: Path | None = None  # a folder of SQLite files; each question is routed to one of them
     sql_db_router: str = "llm"        # llm: the model picks among the top candidates; retrieval: top hit
-    sql_db_candidates: int = 3
+    sql_db_candidates: int = 5
     sql_dialect: str = ""            # used without a database; with one, taken from database_url
     sql_tables: tuple[str, ...] = ()  # limit the live schema to these tables (big databases)
     sql_max_attempts: int = 3
@@ -127,7 +127,7 @@ class Settings:
             database_url=os.getenv("DOCQA_DATABASE_URL") or None,
             database_dir=Path(os.environ["DOCQA_DATABASE_DIR"]) if os.getenv("DOCQA_DATABASE_DIR") else None,
             sql_db_router=_env("DOCQA_DB_ROUTER", "llm"),
-            sql_db_candidates=int(_env("DOCQA_DB_CANDIDATES", "3")),
+            sql_db_candidates=int(_env("DOCQA_DB_CANDIDATES", "5")),
             sql_dialect=_env("DOCQA_SQL_DIALECT", "").lower(),
             sql_tables=tuple(t.strip() for t in _env("DOCQA_SQL_TABLES", "").split(",") if t.strip()),
             sql_max_attempts=int(_env("DOCQA_SQL_MAX_ATTEMPTS", "3")),

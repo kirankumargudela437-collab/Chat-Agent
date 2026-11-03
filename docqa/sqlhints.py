@@ -244,3 +244,112 @@ def error_hint(db, sql: str, error: str, dialect: str = "sqlite") -> str:
     if lines and any(" " in c or "-" in c for cols in tables.values() for c in cols):
         lines.append('Column names with spaces or dashes must be quoted, e.g. "Customer Name" or `Customer Name`.')
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- automatic identifier repair
+
+
+def _key(name: str) -> str:
+    """Name with case, underscores, spaces and dashes ignored: indep_year == IndepYear == "Indep Year"."""
+    return re.sub(r"[\s_\-]+", "", name).lower()
+
+
+def auto_fix_identifiers(db, sql: str, dialect: str = "sqlite") -> str | None:
+    """Rewrite table/column names that differ from the schema only in case or separators.
+
+    A 7B model that saw ``indep_year`` in an example writes it again even after the
+    error hint says ``IndepYear``. When exactly one real name matches once case,
+    underscores and spaces are ignored, the fix is mechanical and needs no model
+    call. A column qualified with the wrong alias is moved to the one table of the
+    query that has it. Returns the repaired SQL, or None when nothing could be fixed.
+    """
+    tables = _columns_by_table(db)
+    if not tables:
+        return None
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except Exception:
+        return None
+    by_key = {_key(t): t for t in tables}
+    changed = False
+    alias_to_table: dict[str, str] = {}
+    alias_spelling: dict[str, str] = {}
+    for t in tree.find_all(exp.Table):
+        real = t.name if t.name in tables else by_key.get(_key(t.name))
+        if real is None:
+            continue
+        if real != t.name:
+            t.set("this", exp.to_identifier(real, quoted=not re.fullmatch(r"[A-Za-z_]\w*", real)))
+            changed = True
+        alias_to_table[(t.alias or real).lower()] = real
+        alias_spelling[(t.alias or real).lower()] = t.alias or real
+        alias_to_table[real.lower()] = real
+    if not alias_to_table:
+        return tree.sql(dialect=dialect) if changed else None
+    select_aliases = {a.alias.lower() for a in tree.find_all(exp.Alias) if a.alias}
+    in_query = list(dict.fromkeys(alias_to_table.values()))
+    for col in tree.find_all(exp.Column):
+        name = col.name
+        if not name or name == "*" or name.lower() in select_aliases:
+            continue
+        qual = (col.table or "").lower()
+        scope = [alias_to_table[qual]] if qual in alias_to_table else in_query
+        if any(name in tables[t] for t in scope):
+            continue
+        hits = [(t, c) for t in scope for c in tables[t] if _key(c) == _key(name)]
+        if not hits and qual in alias_to_table:  # wrong alias: look in the other tables of the query
+            hits = [(t, c) for t in in_query for c in tables[t] if _key(c) == _key(name)]
+        if len({(t, c) for t, c in hits}) != 1:
+            continue
+        table, real = hits[0]
+        col.set("this", exp.to_identifier(real, quoted=not re.fullmatch(r"[A-Za-z_]\w*", real)))
+        if qual and alias_to_table.get(qual) != table:
+            alias = next((a for a, t in alias_to_table.items() if t == table and a != table.lower()), table)
+            col.set("table", exp.to_identifier(alias_spelling.get(alias, alias)))
+        changed = True
+    return tree.sql(dialect=dialect) if changed else None
+
+
+# --------------------------------------------------------------------------- routing evidence
+
+
+def schema_terms(db) -> set[str]:
+    """Stemmed words of every table and column name (``StudentTranscripts`` -> student, transcript)."""
+    from .multidb import _terms
+
+    out: set[str] = set()
+    for t, cols in _columns_by_table(db).items():
+        out.update(_terms(t.replace("_", " ")))
+        out.update(_terms(t))
+        for c in cols:
+            out.update(_terms(c))
+            out.update(_terms(c.replace("_", " ")))
+    return out
+
+
+def schema_fit(question: str, db, values: "ValueIndex | None" = None) -> tuple[float, str]:
+    """How well a database's names and values cover the question, plus a short evidence line.
+
+    Used to choose among look-alike databases (flight_1 / flight_2 / flight_4):
+    the share of the question's content words that are table or column names, and
+    the stored values the question mentions.
+    """
+    from .multidb import _terms
+
+    q = [t for t in dict.fromkeys(_terms(question)) if not t.isdigit()]
+    vocab = schema_terms(db)
+    named = [t for t in q if t in vocab]
+    hits = values.match(question, limit=4) if values is not None else []
+    score = (len(named) / len(q) if q else 0.0) + 0.25 * min(len(hits), 2)
+    bits = []
+    if named:
+        bits.append("names: " + ", ".join(named[:8]))
+    if hits:
+        bits.append("values: " + ", ".join(f"{t}.{c}='{v}'" for t, c, v in hits))
+    missing = [t for t in q if t not in vocab]
+    if missing:
+        bits.append("no match for: " + ", ".join(missing[:6]))
+    return score, "; ".join(bits)

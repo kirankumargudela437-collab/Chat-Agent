@@ -424,11 +424,31 @@ def evaluate(
         yield out
 
 
-def route_only(catalog, examples: Iterable[Example], k: int = 3) -> Iterator[Outcome]:
-    """Routing without a chat model: is the gold database the top hit / in the top ``k``?"""
+def route_only(catalog, examples: Iterable[Example], k: int = 5, fit: bool = True) -> Iterator[Outcome]:
+    """Routing without a chat model: is the gold database the top hit / in the top ``k``?
+
+    With ``fit`` the candidates are reordered by schema and value coverage, as the
+    agent does before the model picks (``--no-fit`` shows retrieval alone).
+    """
+    cache: dict = {}
+
+    def values_for(name, db):
+        from .sqlhints import ValueIndex
+
+        if name not in cache:
+            try:
+                cache[name] = ValueIndex(db, time_budget=10.0)
+            except Exception:
+                cache[name] = None
+        return cache[name]
+
     for ex in examples:
         start = time.monotonic()
         ranked = [n for n, _ in catalog.rank(ex.question, k)]
+        if fit and len(ranked) > 1:
+            from .sql import rerank_by_fit
+
+            ranked, _ = rerank_by_fit(catalog, ex.question, ranked, values_for)
         out = Outcome(ex.id, ex.db_id, ex.question, ex.gold_sql, routed_db=ranked[0] if ranked else "",
                       candidates=ranked, difficulty=ex.difficulty)
         out.correct = out.routed_db == ex.db_id
