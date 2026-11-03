@@ -475,7 +475,7 @@ class SQLAgent:
         db_candidates: int = 5,
         value_lookup: bool = True,
         sql_candidates: int = 1,
-        route_margin: float = 0.15,
+        route_margin: float = 0.25,
         route_choices: int = 2,
     ):
         """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
@@ -810,7 +810,7 @@ def rerank_by_fit(
     for n in candidates:
         try:
             db = catalog.open(n)
-            fit[n], evidence[n] = schema_fit(question, db, values_for(n, db) if values_for else None)
+            fit[n], evidence[n] = schema_fit(question, db, values_for(n, db) if values_for else None, name=n)
         except Exception as e:  # an unreadable database just gets no evidence
             log.debug("No routing evidence for %s: %s", n, e)
             fit[n], evidence[n] = 0.0, ""

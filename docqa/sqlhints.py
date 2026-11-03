@@ -340,12 +340,13 @@ def schema_terms(db) -> set[str]:
     return out
 
 
-def schema_fit(question: str, db, values: "ValueIndex | None" = None) -> tuple[float, str]:
+def schema_fit(question: str, db, values: "ValueIndex | None" = None, name: str = "") -> tuple[float, str]:
     """How well a database's names and values cover the question, plus a short evidence line.
 
     Used to choose among look-alike databases (flight_1 / flight_2 / flight_4):
     the share of the question's content words that are table or column names, and
-    the stored values the question mentions.
+    the stored values the question mentions, plus a bonus when the question uses
+    the database's ``name``.
     """
     from .multidb import _terms
 
@@ -355,6 +356,12 @@ def schema_fit(question: str, db, values: "ValueIndex | None" = None) -> tuple[f
     hits = values.match(question, limit=4) if values is not None else []
     score = (len(named) / len(q) if q else 0.0) + 0.25 * min(len(hits), 2)
     bits = []
+    # The database's own name is evidence too ("members of the Student_Club"). A
+    # multi-word name used in full is strong; a single word (world_1, music_1) is weak.
+    name_terms = [w for w in dict.fromkeys(_terms(name.replace("_", " "))) if not w.isdigit()] if name else []
+    if name_terms and all(w in q for w in name_terms):
+        score += 0.3 if len(name_terms) > 1 else 0.1
+        bits.append("database name: " + name)
     if named:
         bits.append("names: " + ", ".join(named[:8]))
     if hits:

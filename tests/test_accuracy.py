@@ -313,6 +313,18 @@ def test_route_only_reports_fit_margins(tmp_path):
     assert "Fit lead >= 0.15: 100.0% (1/1) of questions, #1 right in 100.0% (1/1)" in bm.summarize(out, True)
 
 
+def test_database_name_in_the_question_counts_for_fit(tmp_path):
+    from docqa.sqlhints import schema_fit
+
+    ddl = "CREATE TABLE member (member_id TEXT, first_name TEXT, position TEXT);"
+    make_db(tmp_path / "student_club.sqlite", ddl)
+    db = open_database(f"sqlite:///{tmp_path / 'student_club.sqlite'}")
+    q = "How many members of the Student_Club have the position of Vice President?"
+    with_name, evidence = schema_fit(q, db, name="student_club")
+    without, _ = schema_fit(q, db, name="card_games")
+    assert with_name - without > 0.29 and "database name: student_club" in evidence
+
+
 def test_route_only_uses_fit(tmp_path):
     make_db(tmp_path / "dbs" / "flight_2" / "flight_2.sqlite", FLIGHT_A)
     make_db(tmp_path / "dbs" / "flight_1" / "flight_1.sqlite", FLIGHT_B)

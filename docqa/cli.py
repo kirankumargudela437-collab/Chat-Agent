@@ -370,7 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--router", choices=["llm", "retrieval"], help="override DOCQA_DB_ROUTER")
     ev.add_argument("--candidates", type=int, help="databases the router considers (default DOCQA_DB_CANDIDATES=5)")
     ev.add_argument("--route-margin", type=float,
-                    help="schema-fit lead that skips the model's database pick (default DOCQA_ROUTE_MARGIN=0.15; 99 = always ask)")
+                    help="schema-fit lead that skips the model's database pick (default DOCQA_ROUTE_MARGIN=0.25; 99 = always ask)")
     ev.add_argument("--route-choices", type=int, help="the model picks among this many top databases (default DOCQA_ROUTE_CHOICES=2)")
     ev.add_argument("--no-fit", action="store_true", help="route-only: rank by retrieval alone, without schema/value fit")
     ev.add_argument("--no-embeddings", action="store_true", help="route with keyword search only")

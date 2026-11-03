@@ -332,13 +332,19 @@ final pick got slightly worse: given five look-alike cards, the 7B model overrod
 correct #1 (employee_hire_evaluation → shop_membership, course_teach → gymnast). So:
 
 * **Trust a clear fit winner.** If #1 leads #2 on schema fit by `DOCQA_ROUTE_MARGIN`
-  (0.15), it is used without a model call. Otherwise the model chooses among only the top
+  (0.25 since round 4), it is used without a model call. Otherwise the model chooses among only the top
   `DOCQA_ROUTE_CHOICES` (2). `--route-margin 99` restores always asking.
   `docqa eval spider --route-only` now prints, per margin, how many questions have a clear
   lead and how often that #1 is right, so the margin can be tuned without a chat model.
 * **"All the information about X"** now means `SELECT * FROM X`, with no joins. This hint is
   added only to questions that say "all the information / details / data", because as a
   general rule the model also applied it to single-column questions.
+
+**Round 4, from the round-3 runs** (Spider 66%, BIRD 53.3%). On BIRD the 0.15 margin
+skipped the model on two student_club questions that schema fit had wrong, one of which
+names "Student_Club" outright. Schema fit now counts the database's own name (a full
+multi-word name +0.3, a single word +0.1), and the default margin is 0.25: on 200 Spider
+questions a lead that large covered 54% of questions with #1 right every time.
 
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
