@@ -226,7 +226,17 @@ def test_rules_tell_the_model_not_to_embellish(tmp_path):
     SQLAgent(llm, db, schema_linking=False, value_lookup=False).run("q?")
     system = llm.prompts[0][0].content
     assert "no extra columns" in system and "GROUP BY their key column" in system and "bridge table" in system
-    assert "SELECT * FROM X's table alone" in system
+    assert "SELECT * FROM that one table" not in system  # only for "all the information" questions
+
+
+def test_select_star_hint_only_for_all_information_questions(tmp_path):
+    db = _country_db(tmp_path)
+    llm = RecordingLLM(responses=["SELECT 1", "SELECT 1"], prompts=[])
+    agent = SQLAgent(llm, db, schema_linking=False, value_lookup=False)
+    agent.run("Show all the information about the countries.")
+    agent.run("Give the name of the country with code ABW.")
+    assert "SELECT * FROM that one table" in llm.prompts[0][0].content
+    assert "SELECT * FROM that one table" not in llm.prompts[1][0].content
 
 
 FLIGHT_A = """

@@ -342,7 +342,6 @@ _RULES = (
     "- Prefer readable CTEs over nested subqueries; use window functions (ROW_NUMBER, RANK, LAG, LEAD, "
     "SUM() OVER) where they fit; guard divisions with NULLIF and handle NULLs with COALESCE.\n"
     "- Return exactly the columns the question asks for, in the order it asks; no extra columns.\n"
-    "- For 'all the information / all details about X', SELECT * FROM X's table alone, with no joins.\n"
     "- Do not add filters, conditions or joins the question does not ask for. Put parentheses around mixed AND/OR.\n"
     "- When counting or grouping people or things, GROUP BY their key column (id), not their name: names repeat.\n"
     "- If two tables only connect through a third (a bridge table), join through it using the foreign keys.\n"
@@ -727,6 +726,8 @@ class SQLAgent:
             "attempts": 0,
             "failures": [],
         }
+        if _ASKS_FOR_ALL.search(question):
+            base["hint"] = ALL_INFO_HINT
         limit = {"recursion_limit": 4 * self.max_attempts + 10}
         states = [self._graph.invoke(base, limit)]
         if self.sql_candidates > 1 and self.db is not None:
@@ -735,7 +736,7 @@ class SQLAgent:
                 variant = {
                     **base,
                     "mapping": states[0].get("mapping", ""),
-                    "hint": CANDIDATE_HINTS[(i - 1) % len(CANDIDATE_HINTS)],
+                    "hint": " ".join(filter(None, [base.get("hint"), CANDIDATE_HINTS[(i - 1) % len(CANDIDATE_HINTS)]])),
                     # different example order/subset per candidate (MCS-SQL)
                     "examples": shots[i % len(shots):] + shots[: i % len(shots)] if shots else [],
                 }
@@ -819,6 +820,12 @@ def rerank_by_fit(
     if scores is not None:
         scores.update(adjusted)  # the ranking score of each candidate, for the caller's margin check
     return ranked, evidence
+
+
+# Only for questions that ask for whole rows: as a general rule the 7B model also
+# applied it to "give the airline with abbreviation UAL" and returned every column.
+_ASKS_FOR_ALL = re.compile(r"\ball\s+(?:the\s+)?(?:information|info|details|data|attributes|columns)\b", re.I)
+ALL_INFO_HINT = "The question asks for all the information: SELECT * FROM that one table, with no joins."
 
 
 # Different instructions per extra candidate, so a temperature-0 model writes

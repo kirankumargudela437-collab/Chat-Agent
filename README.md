@@ -336,7 +336,9 @@ correct #1 (employee_hire_evaluation → shop_membership, course_teach → gymna
   `DOCQA_ROUTE_CHOICES` (2). `--route-margin 99` restores always asking.
   `docqa eval spider --route-only` now prints, per margin, how many questions have a clear
   lead and how often that #1 is right, so the margin can be tuned without a chat model.
-* **"All the information about X"** now means `SELECT * FROM X`, with no joins.
+* **"All the information about X"** now means `SELECT * FROM X`, with no joins. This hint is
+  added only to questions that say "all the information / details / data", because as a
+  general rule the model also applied it to single-column questions.
 
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
