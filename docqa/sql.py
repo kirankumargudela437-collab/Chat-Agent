@@ -43,6 +43,8 @@ from typing import Any, Optional, TypedDict
 
 import sqlglot
 from sqlglot import exp
+
+from .sqlhints import ValueIndex, error_hint, format_value_hints
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import AIMessage, HumanMessage
@@ -321,6 +323,7 @@ _RULES = (
     "- Follow the style of the golden examples when one is similar.\n"
     "- Unless the question asks for everything, return at most {max_rows} rows.\n"
     "- Output only the SQL in one ```sql block, no explanation."
+    "{hint}"
 )
 
 LINK_PROMPT = ChatPromptTemplate.from_messages(
@@ -396,6 +399,8 @@ class SQLState(TypedDict, total=False):
     failures: list
     result: Optional[QueryResult]
     executed: bool
+    hint: str
+    votes: int
 
 
 @dataclass
@@ -413,6 +418,8 @@ class SQLResult:
     failures: list[tuple[str, str]] = field(default_factory=list)  # (sql, error) of earlier attempts
     database: str = ""  # with a database folder: the database the question was routed to
     candidates: list[str] = field(default_factory=list)  # the databases the router considered
+    votes: int = 0  # with several candidate queries: how many returned the chosen result
+    n_candidates: int = 1
 
     @property
     def ok(self) -> bool:
@@ -439,6 +446,8 @@ class SQLAgent:
         catalog=None,
         db_router: str = "llm",
         db_candidates: int = 3,
+        value_lookup: bool = True,
+        sql_candidates: int = 1,
     ):
         """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
         self.llm = llm
@@ -459,6 +468,9 @@ class SQLAgent:
         self.dialect = dialect or (dialect_from_url(str(db._engine.url)) if db is not None else "postgres")
         if db is not None and db.dialect == "sqlite":
             self.dialect = "sqlite"
+        self.value_lookup = value_lookup
+        self.sql_candidates = max(1, sql_candidates)
+        self._value_indexes: dict[str, object] = {}
         self.max_attempts = max_attempts
         self.max_rows = max_rows
         self.schema_linking = schema_linking
@@ -564,9 +576,12 @@ class SQLAgent:
             "context": s.get("context") or "(none)",
             "mapping": s.get("mapping") or "(not done)",
             "question": s["question"],
+            "hint": f"\n- {s['hint']}" if s.get("hint") else "",
         }
 
     def _node_link(self, s: SQLState) -> dict:
+        if s.get("mapping"):  # reused from an earlier candidate
+            return {"mapping": s["mapping"]}
         if not self.schema_linking:
             return {"mapping": ""}
         return {"mapping": self._link.invoke(self._base(s)).strip()}
@@ -592,7 +607,9 @@ class SQLAgent:
         try:
             res = run_query(self.db, sql, self.max_rows)
         except Exception as e:  # the exact database error drives the next attempt
-            return self._fail(s, _db_error(e))
+            error = _db_error(e)
+            hint = error_hint(self.db, sql, error, self.dialect)
+            return self._fail(s, f"{error}\n{hint}" if hint else error)
         return {"sql": sql, "result": res, "executed": True}
 
     def _fail(self, s: SQLState, error: str) -> dict:
@@ -638,17 +655,51 @@ class SQLAgent:
             else:
                 name, candidates = self.route(question)
             self.use_database(name)
-        state = self._graph.invoke(
-            {
-                "question": question,
-                "schema": self.schema_text(schema, question, context),
-                "context": context,
-                "examples": list(examples or []),
-                "attempts": 0,
-                "failures": [],
-            },
-            {"recursion_limit": 4 * self.max_attempts + 10},
-        )
+        context = self._with_value_hints(question, context)
+        base = {
+            "question": question,
+            "schema": self.schema_text(schema, question, context),
+            "context": context,
+            "examples": list(examples or []),
+            "attempts": 0,
+            "failures": [],
+        }
+        limit = {"recursion_limit": 4 * self.max_attempts + 10}
+        states = [self._graph.invoke(base, limit)]
+        if self.sql_candidates > 1 and self.db is not None:
+            shots = list(examples or [])
+            for i in range(1, self.sql_candidates):
+                variant = {
+                    **base,
+                    "mapping": states[0].get("mapping", ""),
+                    "hint": CANDIDATE_HINTS[(i - 1) % len(CANDIDATE_HINTS)],
+                    # different example order/subset per candidate (MCS-SQL)
+                    "examples": shots[i % len(shots):] + shots[: i % len(shots)] if shots else [],
+                }
+                states.append(self._graph.invoke(variant, limit))
+        state = vote(states)
+        return self._result(question, state, candidates, len(states))
+
+    def _with_value_hints(self, question: str, context: str) -> str:
+        """Append the database values the question mentions (CHESS-style value retrieval)."""
+        if not self.value_lookup or self.db is None:
+            return context
+        key = self.database_name or str(self.db._engine.url)
+        if key not in self._value_indexes:
+            try:
+                self._value_indexes[key] = ValueIndex(self.db)
+            except Exception as e:  # never let the lookup break a question
+                log.info("Value index failed for %s: %s", key, e)
+                self._value_indexes[key] = None
+        index = self._value_indexes[key]
+        if not index:
+            return context
+        hints = format_value_hints(index.match(f"{question}\n{context}"))
+        if not hints:
+            return context
+        return f"{context}\n\n{hints}" if context else hints
+
+    def _result(self, question: str, state: dict, candidates: list[str], n_candidates: int) -> SQLResult:
         res = state.get("result")
         failures = list(state.get("failures", []))
         error = state.get("error")
@@ -666,6 +717,8 @@ class SQLAgent:
             failures=failures[:-1] if error else failures,
             database=self.database_name if self.catalog is not None else "",
             candidates=candidates,
+            votes=state.get("votes", 0),
+            n_candidates=n_candidates,
         )
 
     def summary_inputs(self, r: SQLResult) -> dict:
@@ -682,6 +735,41 @@ class SQLAgent:
 
     def stream_summary(self, r: SQLResult):
         yield from self._summary.stream(self.summary_inputs(r))
+
+
+# Different instructions per extra candidate, so a temperature-0 model writes
+# genuinely different queries (CHASE-SQL uses several generator styles the same way).
+CANDIDATE_HINTS = (
+    "Write it with explicit JOINs; avoid nested subqueries where a JOIN works.",
+    "Write it step by step with CTEs (WITH ...), one CTE per intermediate result.",
+    "Before writing, re-check which table each column belongs to and the exact filter values.",
+    "Prefer a simple query: no extra columns, no extra joins, only what the question asks for.",
+)
+
+
+def _result_key(res: QueryResult) -> tuple:
+    rows = [tuple(round(v, 6) if isinstance(v, float) else v for v in r) for r in res.rows]
+    return tuple(sorted(map(repr, rows)))
+
+
+def vote(states: list[dict]) -> dict:
+    """The candidate whose result most candidates agree on (self-consistency, as in MCS-SQL / CHASE-SQL).
+
+    Only queries that ran count; a non-empty result beats an empty one on ties,
+    and the earliest candidate wins a remaining tie. With one state it is returned as is.
+    """
+    if len(states) == 1:
+        return states[0]
+    ok = [(i, s) for i, s in enumerate(states) if s.get("executed") and not s.get("error") and s.get("result")]
+    if not ok:
+        return states[0]
+    groups: dict[tuple, list[int]] = {}
+    for i, s in ok:
+        groups.setdefault(_result_key(s["result"]), []).append(i)
+    best = max(groups.items(), key=lambda kv: (len(kv[1]), kv[0] != (), -kv[1][0]))
+    chosen = dict(states[best[1][0]])
+    chosen["votes"] = len(best[1])
+    return chosen
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

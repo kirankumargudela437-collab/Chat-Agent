@@ -209,7 +209,7 @@ def cmd_eval(args) -> int:
     import json
 
     from . import open_catalog
-    from .benchmark import evaluate, locate, pick, read_results, route_only, summarize, write_result
+    from .benchmark import TRAIN_FILES, evaluate, locate, pick, read_results, route_only, summarize, write_result
 
     s = _settings(args)
     split = locate(args.name, Path(args.data or f"./benchmarks/{args.name}"), args.questions)
@@ -251,8 +251,19 @@ def cmd_eval(args) -> int:
             schema_chars=s.sql_schema_chars,
             db_router=args.router or s.sql_db_router,
             db_candidates=k,
+            value_lookup=s.sql_value_lookup and not args.no_values,
+            sql_candidates=args.sql_candidates or s.sql_candidates,
         )
-        outcomes = evaluate(agent, split, examples, args.oracle_db, args.timeout, done)
+        bank = None
+        if args.shots:
+            from .benchmark import ExampleBank
+
+            bank = ExampleBank.from_benchmark(args.name, Path(args.train or split.questions_file.parent))
+            if bank is None:
+                print(f"No training questions found for --shots (looked for {', '.join(TRAIN_FILES[args.name])}); running zero-shot.")
+            else:
+                print(f"Few-shot: {args.shots} similar solved questions per question from {len(bank)} training examples")
+        outcomes = evaluate(agent, split, examples, args.oracle_db, args.timeout, done, bank, args.shots)
     out.parent.mkdir(parents=True, exist_ok=True)
     results = []
     with open(out, "a" if args.resume else "w", encoding="utf-8") as fh:
@@ -269,7 +280,7 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
@@ -360,6 +371,10 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--no-linking", action="store_true", help="skip the schema-linking call (faster, usually less accurate)")
     ev.add_argument("--timeout", type=float, default=30.0, help="seconds per query execution")
     ev.add_argument("--resume", help="continue a results .jsonl from an interrupted run")
+    ev.add_argument("--shots", type=int, default=0, help="show N similar solved training questions per question (DAIL-SQL style)")
+    ev.add_argument("--train", help="folder with the training questions for --shots (default: next to dev.json)")
+    ev.add_argument("--no-values", action="store_true", help="don't look up matching database values")
+    ev.add_argument("--sql-candidates", type=int, help="write N queries and keep the majority result (default DOCQA_SQL_CANDIDATES=1)")
     ev.set_defaults(func=cmd_eval)
 
     sa = sub.add_parser("sample", help="create sample docs, code, SQL and a SQLite database to try the agent")

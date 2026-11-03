@@ -87,7 +87,8 @@ def _agent(env_file: str, docs_dir: str, db_url: str, dialect: str, schema: str)
         sql = SQLAgent(llm, db, dialect=s.sql_dialect, max_attempts=s.sql_max_attempts,
                        max_rows=s.sql_max_rows, schema_linking=s.sql_schema_linking,
                        max_tables=s.sql_max_tables, schema_chars=s.sql_schema_chars,
-                       catalog=catalog, db_router=s.sql_db_router, db_candidates=s.sql_db_candidates)
+                       catalog=catalog, db_router=s.sql_db_router, db_candidates=s.sql_db_candidates,
+                       value_lookup=s.sql_value_lookup, sql_candidates=s.sql_candidates)
         st.session_state.agent = Agent(llm, vs, top_k=s.top_k, sql_agent=sql, hybrid=s.hybrid_search)
         st.session_state.agent_key = key
         st.session_state.messages = []

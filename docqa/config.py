@@ -66,6 +66,8 @@ class Settings:
     sql_max_attempts: int = 3
     sql_max_rows: int = 50
     sql_schema_linking: bool = True
+    sql_value_lookup: bool = True     # find database values the question mentions (exact spellings)
+    sql_candidates: int = 1           # >1: write several queries, keep the result most of them return
     hybrid_search: bool = True        # keyword (BM25) + vector search
     sql_max_tables: int = 20          # bigger databases: show only the most relevant tables
     sql_schema_chars: int = 12000     # cap on the schema text sent to the model
@@ -131,6 +133,8 @@ class Settings:
             sql_max_attempts=int(_env("DOCQA_SQL_MAX_ATTEMPTS", "3")),
             sql_max_rows=int(_env("DOCQA_SQL_MAX_ROWS", "50")),
             sql_schema_linking=_flag("DOCQA_SQL_SCHEMA_LINKING", "1"),
+            sql_value_lookup=_flag("DOCQA_SQL_VALUE_LOOKUP", "1"),
+            sql_candidates=int(_env("DOCQA_SQL_CANDIDATES", "1")),
             sql_max_tables=int(_env("DOCQA_SQL_MAX_TABLES", "20")),
             hybrid_search=_flag("DOCQA_HYBRID_SEARCH", "1"),
             sql_schema_chars=int(_env("DOCQA_SQL_SCHEMA_CHARS", "12000")),

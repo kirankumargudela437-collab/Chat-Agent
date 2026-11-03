@@ -207,6 +207,75 @@ def pick(examples: list[Example], limit: int | None, seed: int = 0, db: str | No
     return examples
 
 
+# --------------------------------------------------------------------------- few-shot examples
+
+
+TRAIN_FILES = {
+    "spider": ("train_spider.json", "train_others.json"),
+    "bird": ("train.json",),
+}
+
+
+class ExampleBank:
+    """Solved training questions, retrieved by similarity to a new question (DAIL-SQL's example selection).
+
+    Small models gain most from seeing a few solved questions shaped like the new
+    one. DAIL-SQL (Gao et al., 2023) picks them by question similarity after
+    masking domain words, so "How many singers are older than 30?" retrieves
+    "How many pilots are younger than 25?". Here: BM25 over the question with
+    numbers, quoted values and words that are names in the target schema removed.
+    Examples from the target database itself are never used (in Spider and BIRD
+    the training databases are disjoint from dev anyway).
+    """
+
+    def __init__(self, examples: list[Example]):
+        from .multidb import _BM25
+
+        self.examples = [e for e in examples if e.gold_sql]
+        self._bm25 = _BM25([_skeleton(e.question) for e in self.examples])
+
+    @classmethod
+    def from_benchmark(cls, benchmark: str, data_dir: Path) -> "ExampleBank | None":
+        files = []
+        for name in TRAIN_FILES.get(benchmark, ()):
+            files += [p for p in sorted(Path(data_dir).rglob(name)) if "__MACOSX" not in p.parts]
+        if not files:
+            return None
+        rows = []
+        for f in files:
+            for i, r in enumerate(json.loads(f.read_text(encoding="utf-8"))):
+                rows.append(Example(id=f"{f.stem}-{i}", db_id=r["db_id"], question=r["question"],
+                                    gold_sql=r.get("SQL") or r.get("query") or "", evidence=r.get("evidence", "") or ""))
+        return cls(rows)
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def similar(self, question: str, k: int = 4, exclude_db: str | None = None, schema_words: set[str] = frozenset()) -> list[tuple[str, str]]:
+        scores = self._bm25.scores(_skeleton(question, schema_words))
+        order = sorted(range(len(scores)), key=lambda i: -scores[i])
+        out, seen = [], set()
+        for i in order:
+            e = self.examples[i]
+            if scores[i] <= 0 or len(out) >= k:
+                break
+            if e.db_id == exclude_db or e.gold_sql in seen:
+                continue
+            seen.add(e.gold_sql)
+            q = f"{e.question}\n(Hint: {e.evidence})" if e.evidence else e.question
+            out.append((q, e.gold_sql.strip().rstrip(";")))
+        return out[::-1]  # most similar last, closest to the new question
+
+
+def _skeleton(question: str, schema_words: set[str] = frozenset()) -> str:
+    """The question with values masked: numbers, quoted strings and schema names removed."""
+    q = re.sub(r"'[^']*'|\"[^\"]*\"", " value ", question)
+    q = re.sub(r"\d+(?:\.\d+)?", " number ", q)
+    if schema_words:
+        q = " ".join(w for w in q.split() if w.lower().strip("?,.") not in schema_words)
+    return q
+
+
 # --------------------------------------------------------------------------- execution
 
 
@@ -252,12 +321,46 @@ def has_top_level_order_by(sql: str) -> bool:
 
 
 def results_match(gold: list[tuple], pred: list[tuple], benchmark: str, ordered: bool = False) -> bool:
+    """BIRD: row sets, as BIRD's evaluation.py. Spider: rows, with columns in any order.
+
+    Spider's official execution match (``exec_eval.py`` in taoyds/test-suite-sql-eval)
+    accepts ``SELECT name, year`` for a gold ``SELECT year, name``: it tries the
+    column permutations whose per-column values agree. The first version of this
+    function compared columns in order and under-counted.
+    """
     g, p = [_norm(r) for r in gold], [_norm(r) for r in pred]
     if benchmark == "bird":
         return set(g) == set(p)
-    if ordered:
-        return g == p
-    return Counter(g) == Counter(p)
+
+    def same(rows_p):
+        return rows_p == g if ordered else Counter(rows_p) == Counter(g)
+
+    if same(p):
+        return True
+    if not g or not p or len(g) != len(p) or len(g[0]) != len(p[0]) or len(g[0]) > 8:
+        return False
+    for perm in column_permutations(g, p):
+        if same([tuple(r[j] for j in perm) for r in p]):
+            return True
+    return False
+
+
+def column_permutations(gold: list[tuple], pred: list[tuple]):
+    """Orders of the predicted columns whose values, column by column, match the gold columns'."""
+    n = len(gold[0])
+    gcols = [Counter(r[i] for r in gold) for i in range(n)]
+    pcols = [Counter(r[j] for r in pred) for j in range(n)]
+    options = [[j for j in range(n) if pcols[j] == gcols[i]] for i in range(n)]
+
+    def walk(i, used, acc):
+        if i == n:
+            yield tuple(acc)
+            return
+        for j in options[i]:
+            if j not in used:
+                yield from walk(i + 1, used | {j}, acc + [j])
+
+    yield from walk(0, frozenset(), [])
 
 
 # --------------------------------------------------------------------------- evaluation
@@ -287,6 +390,8 @@ def evaluate(
     oracle_db: bool = False,
     timeout: float = 30.0,
     done: dict[str, dict] | None = None,
+    bank: "ExampleBank | None" = None,
+    shots: int = 4,
 ) -> Iterator[Outcome]:
     """Ask ``agent`` (a ``SQLAgent`` with a catalog) every question; yield one ``Outcome`` each."""
     done = done or {}
@@ -305,7 +410,8 @@ def evaluate(
         start = time.monotonic()
         context = f"[1] (source: benchmark evidence)\n{ex.evidence}" if ex.evidence else ""
         try:
-            r = agent.run(ex.question, context=context, database=ex.db_id if oracle_db else None)
+            shown = bank.similar(ex.question, shots, exclude_db=ex.db_id) if bank and shots else None
+            r = agent.run(ex.question, context=context, database=ex.db_id if oracle_db else None, examples=shown)
             out.pred_sql, out.attempts, out.routed_db, out.candidates = r.sql, r.attempts, r.database, r.candidates
             if r.error:
                 out.error = r.error

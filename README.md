@@ -279,6 +279,31 @@ routes across every database in the folder (all 166 for Spider), which is harder
 the leaderboard setting. A full Spider dev run is ~3 model calls per question; on a
 local 7B model start with `--limit 50 --no-linking` and compare.
 
+### Getting more out of a small local model
+
+Measured on Kiran's PC with `qwen2.5-coder:7b` (2026-11-03, before these features):
+Spider 54% (50 questions, routed across 166 databases), BIRD dev 50% (30 questions).
+The misses were wrong databases, made-up column names, filter values spelled differently
+from the data, and (Spider only) correct answers scored wrong because of column order.
+Each fix below comes from a published text-to-SQL agent:
+
+| Setting | What it does | Idea from | Cost |
+|---|---|---|---|
+| on by default (`DOCQA_SQL_VALUE_LOOKUP=0` or `--no-values` to turn off) | Reads the distinct short text values of every column once per database and tells the model which ones the question mentions: "Commander" becomes `cards.type = 'commander'`, "1:54" becomes `'01:54'` | CHESS (entity and value retrieval), Vanna | a few seconds per database, once |
+| always on | When a query fails with `no such column` / `no such table` / `ambiguous column`, the retry is told the aliased table's real columns, the closest-named columns anywhere, and that names with spaces need quotes | DIN-SQL self-correction, MAC-SQL refiner, CHESS revisor | none |
+| `--shots 4` (eval) | Shows the 4 most similar solved training questions (numbers and values masked before matching) as earlier chat turns. Spider's `train_spider.json` comes with the download; BIRD needs its separate train set | DAIL-SQL | a longer prompt |
+| `DOCQA_SQL_CANDIDATES=3` or `--sql-candidates 3` | Writes 3 queries with different instructions (JOINs, CTEs, re-check columns, keep it simple) and keeps the result most of them return; a non-empty result wins a tie | MCS-SQL, CHASE-SQL (self-consistency) | ~3x time per question |
+| scoring fix | Spider now accepts the same columns in a different order, like Spider's official `exec_eval.py` | test-suite-sql-eval | none |
+
+For your own database the same features apply in `chat`, `ask` and the app; your golden
+SQL file plays the role of the training set.
+
+```bash
+docqa eval spider --limit 50 --shots 4                    # values + error hints + 4 examples
+docqa eval spider --limit 50 --shots 4 --sql-candidates 3 # plus voting (slow on a laptop)
+docqa eval bird --limit 30 --no-values                    # measure one feature at a time
+```
+
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
 tells you to download in a browser and pass `--zip`. The schema indexer built `PRAGMA table_info('{t}')`
