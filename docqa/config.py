@@ -63,6 +63,8 @@ class Settings:
     sql_max_attempts: int = 3
     sql_max_rows: int = 50
     sql_schema_linking: bool = True
+    sql_max_tables: int = 20          # bigger databases: show only the most relevant tables
+    sql_schema_chars: int = 12000     # cap on the schema text sent to the model
     extensions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -116,6 +118,8 @@ class Settings:
             sql_max_attempts=int(_env("DOCQA_SQL_MAX_ATTEMPTS", "3")),
             sql_max_rows=int(_env("DOCQA_SQL_MAX_ROWS", "50")),
             sql_schema_linking=_flag("DOCQA_SQL_SCHEMA_LINKING", "1"),
+            sql_max_tables=int(_env("DOCQA_SQL_MAX_TABLES", "20")),
+            sql_schema_chars=int(_env("DOCQA_SQL_SCHEMA_CHARS", "12000")),
         )
 
     @property

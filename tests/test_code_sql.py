@@ -360,3 +360,73 @@ def test_cli_bad_database_url_is_a_clean_error(tmp_path, monkeypatch, capsys):
     (tmp_path / "docs").mkdir()
     code = main(["--env-file", "none", "--docs", str(tmp_path / "docs"), "--db", "sqlite:///missing.db", "ask", "q"])
     assert code == 2 and "not found" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- organisation-specific schemas
+
+
+@pytest.fixture
+def legacy_db(tmp_path):
+    """An organisation's database with legacy names and many unrelated tables."""
+    import sqlite3
+
+    path = tmp_path / "org.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE usr_mst (usr_id INTEGER PRIMARY KEY, tier_cd INTEGER, lt_spend REAL);"
+        "CREATE TABLE ord_hdr (ord_id INTEGER PRIMARY KEY, usr_id INTEGER REFERENCES usr_mst(usr_id), net_amt REAL);"
+        "CREATE TABLE rgn_lkp (rgn_id INTEGER PRIMARY KEY, rgn_nm TEXT);"
+        + "".join(f"CREATE TABLE audit_log_{i} (id INTEGER PRIMARY KEY, msg TEXT);" for i in range(30))
+        + "INSERT INTO usr_mst VALUES (1, 5, 12000), (2, 1, 50);"
+    )
+    conn.close()
+    return open_database(f"sqlite:///{path.as_posix()}")
+
+
+def test_big_database_shows_tables_named_in_the_business_rules_plus_fk_neighbours(legacy_db):
+    agent = SQLAgent(FakeListChatModel(responses=[]), legacy_db, max_tables=4)
+    rules = "[1] A gold tier user means usr_mst.tier_cd = 5 and lt_spend > 10000."
+    chosen = agent.select_tables("How many gold tier users placed orders?", rules)
+    assert chosen[0] == "usr_mst" and "ord_hdr" in chosen and len(chosen) == 4
+    text = agent.schema_text("", "How many gold tier users placed orders?", rules)
+    assert "CREATE TABLE usr_mst" in text and "CREATE TABLE ord_hdr" in text
+    assert "29 more tables not shown" in text
+
+
+def test_small_database_is_shown_whole(db):
+    agent = SQLAgent(FakeListChatModel(responses=[]), db)
+    assert agent.select_tables("anything") == ["customers", "orders"]
+
+
+def test_schema_text_respects_the_character_budget(legacy_db):
+    agent = SQLAgent(FakeListChatModel(responses=[]), legacy_db, max_tables=33, schema_chars=600)
+    text = agent.schema_text("", "users")
+    assert 0 < text.count("CREATE TABLE") < 33 and "more tables not shown" in text
+
+
+def test_table_ranking_uses_embeddings_when_available(legacy_db):
+    class KeywordEmbeddings:
+        def embed_documents(self, texts):
+            return [self.embed_query(t) for t in texts]
+
+        def embed_query(self, text):
+            t = text.lower()
+            return [float("rgn" in t or "region" in t), float("audit" in t), 0.1]
+
+    agent = SQLAgent(FakeListChatModel(responses=[]), legacy_db, max_tables=2, embeddings=KeywordEmbeddings())
+    assert agent.select_tables("Revenue by region")[0] == "rgn_lkp"
+
+
+def test_golden_examples_are_shown_as_earlier_turns(db):
+    llm = RecordingLLM(responses=["map", GOOD], prompts=[])
+    SQLAgent(llm, db).run("Rank customers", examples=[("Top product", "SELECT product_name FROM orders")])
+    msgs = llm.prompts[1]
+    assert [type(m).__name__ for m in msgs] == ["SystemMessage", "HumanMessage", "AIMessage", "HumanMessage"]
+    assert msgs[1].content == "Top product" and "SELECT product_name" in msgs[2].content
+
+
+def test_agent_passes_indexed_golden_examples_as_turns(indexed, db):
+    llm = RecordingLLM(responses=["map", GOOD, "Acme leads."], prompts=[])
+    Agent(llm, indexed, sql_agent=SQLAgent(llm, db)).ask("Monthly revenue growth", route="sql")
+    generate = llm.prompts[1]
+    assert any(type(m).__name__ == "AIMessage" and "LAG(net_revenue)" in m.content for m in generate)

@@ -172,6 +172,26 @@ user**: that is the only guarantee the database itself enforces. Large databases
 `DOCQA_SQL_TABLES=orders,customers` limits the schema sent to the model. Install the
 driver for your database yourself (`psycopg`, `pymysql`, `pyodbc`, `snowflake-sqlalchemy`, ...).
 
+## Using it for several organisations
+
+Nothing about a company's schema is hard-coded. Each organisation needs three things, and
+all of them live in its own folder and settings:
+
+| Layer | How docqa gets it | Per organisation |
+|---|---|---|
+| Schema | read from the live database at start-up (SQLAlchemy reflection: `CREATE TABLE`, foreign keys, 3 sample rows per table). Big databases: only the most relevant `DOCQA_SQL_MAX_TABLES` (20) tables are shown per question, ranked by tables named in the question or in the retrieved business rules, then embedding similarity, plus their foreign-key neighbours, within `DOCQA_SQL_SCHEMA_CHARS` (12000). | `DOCQA_DATABASE_URL` |
+| Data dictionary | the organisation's PDFs, DOCX, Markdown, wiki exports in its folder | `DOCQA_DOCS_DIR` |
+| Golden SQL | 5-10 of the team's own queries as `-- Question:` blocks in a `.sql` file in that folder, shown to the model as worked examples | same folder |
+
+Keep one `.env` per organisation and pick it with `--env-file`:
+
+```bash
+docqa --env-file acme.env sync
+docqa --env-file acme.env ui
+```
+
+Each docs folder gets its own index, so organisations never see each other's documents.
+
 ## Writing documents the SQL route can use
 
 Plain sentences work. Three patterns help most:
@@ -286,8 +306,10 @@ print(ans.sql.sql, ans.sql.columns, ans.sql.rows)
 
 You don't need any of these to use docqa, but they're good to compare against or borrow ideas from:
 
-* **Vanna** (text-to-SQL trained on DDL, docs and past queries): the closest match to the SQL route.
-  Use it if SQL is all you need and you want its hosted UI and integrations.
+* **Vanna** (MIT; text-to-SQL trained on DDL, docs and past queries): the closest match to the SQL
+  route. Two ideas here come from reading its `generate_sql`: picking the related tables per question
+  instead of sending the whole schema, and passing golden examples as earlier chat turns. No code is
+  copied. Use Vanna itself if SQL is all you need and you want its UI and integrations.
 * **WrenAI** (semantic layer + GenBI app): use it when many people need governed metrics and charts,
   not one person's chat.
 * **Continue / Aider / Cody** (code assistants in the editor or terminal): better for editing code;

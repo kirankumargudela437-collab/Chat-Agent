@@ -67,7 +67,8 @@ def _agent(env_file: str, docs_dir: str, db_url: str, dialect: str, schema: str)
         vs, _ = _index(env_file, docs_dir)
         db = _database(db_url, s.sql_tables) if db_url else None
         sql = SQLAgent(llm, db, dialect=s.sql_dialect, max_attempts=s.sql_max_attempts,
-                       max_rows=s.sql_max_rows, schema_linking=s.sql_schema_linking)
+                       max_rows=s.sql_max_rows, schema_linking=s.sql_schema_linking,
+                       max_tables=s.sql_max_tables, schema_chars=s.sql_schema_chars)
         st.session_state.agent = Agent(llm, vs, top_k=s.top_k, sql_agent=sql)
         st.session_state.agent_key = key
         st.session_state.messages = []

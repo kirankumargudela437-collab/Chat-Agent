@@ -24,6 +24,8 @@ def build_sql_agent(settings: Settings, llm=None):
         max_attempts=settings.sql_max_attempts,
         max_rows=settings.sql_max_rows,
         schema_linking=settings.sql_schema_linking,
+        max_tables=settings.sql_max_tables,
+        schema_chars=settings.sql_schema_chars,
     )
 
 

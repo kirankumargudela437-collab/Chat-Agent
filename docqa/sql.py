@@ -45,7 +45,8 @@ import sqlglot
 from sqlglot import exp
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 log = logging.getLogger(__name__)
 
@@ -184,23 +185,42 @@ class Database:
         self._metadata = MetaData()
         self._metadata.reflect(bind=engine, only=self.table_names, views=True)
 
-    def get_table_info(self) -> str:
-        from sqlalchemy import select
-        from sqlalchemy.schema import CreateTable
+    def table_infos(self) -> dict[str, str]:
+        """``CREATE TABLE`` (with foreign keys) plus a few sample rows, per table. Cached."""
+        if getattr(self, "_infos", None) is None:
+            from sqlalchemy import select
+            from sqlalchemy.schema import CreateTable
 
-        out = []
+            infos = {}
+            for table in self._metadata.sorted_tables:
+                info = str(CreateTable(table).compile(self._engine)).strip()
+                if self.sample_rows:
+                    try:
+                        with self._engine.connect() as conn:
+                            rows = conn.execute(select(table).limit(self.sample_rows)).fetchall()
+                        sample = rows_as_text([c.name for c in table.columns], [tuple(r) for r in rows], width=40)
+                        info += f"\n\n/* {len(rows)} sample rows from {table.name}:\n{sample}\n*/"
+                    except Exception as e:  # pragma: no cover - permissions on one table
+                        log.debug("No sample rows for %s: %s", table.name, e)
+                infos[table.name] = info
+            self._infos = infos
+        return self._infos
+
+    def neighbours(self, name: str) -> set[str]:
+        """Tables joined to ``name`` by a foreign key, in either direction."""
+        out = set()
         for table in self._metadata.sorted_tables:
-            info = str(CreateTable(table).compile(self._engine)).strip()
-            if self.sample_rows:
-                try:
-                    with self._engine.connect() as conn:
-                        rows = conn.execute(select(table).limit(self.sample_rows)).fetchall()
-                    sample = rows_as_text([c.name for c in table.columns], [tuple(r) for r in rows], width=40)
-                    info += f"\n\n/* {len(rows)} sample rows from {table.name}:\n{sample}\n*/"
-                except Exception as e:  # pragma: no cover - permissions on one table
-                    log.debug("No sample rows for %s: %s", table.name, e)
-            out.append(info)
-        return "\n\n".join(out)
+            for fk in table.foreign_keys:
+                parent = fk.column.table.name
+                if table.name == name:
+                    out.add(parent)
+                elif parent == name:
+                    out.add(table.name)
+        out.discard(name)
+        return out
+
+    def get_table_info(self) -> str:
+        return "\n\n".join(self.table_infos().values())
 
 
 def open_database(url: str, tables: tuple[str, ...] = (), sample_rows: int = 3) -> Database:
@@ -288,6 +308,9 @@ GENERATE_PROMPT = ChatPromptTemplate.from_messages(
             "Schema:\n{schema}\n\nBusiness rules, schema notes and golden examples:\n{context}\n\n"
             "Mapping of the question onto the schema:\n{mapping}",
         ),
+        # golden examples as earlier turns: small models copy a worked answer more
+        # faithfully than an example buried in the instructions (Vanna does the same)
+        MessagesPlaceholder("examples", optional=True),
         ("human", "{question}"),
     ]
 )
@@ -325,6 +348,7 @@ class SQLState(TypedDict, total=False):
     question: str
     schema: str
     context: str
+    examples: list
     mapping: str
     sql: str
     error: Optional[str]
@@ -367,8 +391,15 @@ class SQLAgent:
         max_attempts: int = 3,
         max_rows: int = 50,
         schema_linking: bool = True,
+        embeddings=None,
+        max_tables: int = 20,
+        schema_chars: int = 12000,
     ):
         self.llm = llm
+        self.embeddings = embeddings  # to pick the relevant tables of a big database
+        self.max_tables = max_tables
+        self.schema_chars = schema_chars
+        self._table_vectors: dict[str, list[float]] | None = None
         self.db = db
         self.dialect = dialect or (dialect_from_url(str(db._engine.url)) if db is not None else "postgres")
         if db is not None and db.dialect == "sqlite":
@@ -381,21 +412,69 @@ class SQLAgent:
         self._fix = FIX_PROMPT | llm | StrOutputParser()
         self._summary = SUMMARY_PROMPT | llm | StrOutputParser()
         self._graph = self._build_graph()
-        self._schema_cache: str | None = None
 
     # -- schema ---------------------------------------------------------------------
 
     def live_schema(self) -> str:
-        if self.db is None:
-            return ""
-        if self._schema_cache is None:
-            self._schema_cache = self.db.get_table_info()
-        return self._schema_cache
+        return self.db.get_table_info() if self.db is not None else ""
 
-    def schema_text(self, pasted: str = "") -> str:
+    def select_tables(self, question: str, context: str = "") -> list[str]:
+        """The live tables to show the model, most relevant first.
+
+        A small database is shown whole. In a big one (more than ``max_tables``) a
+        table ranks high when the question or the retrieved business rules name it
+        (a data dictionary that says "join usr_mst to ord_hdr" pulls both in), then
+        by embedding similarity to the question, and tables joined to the top ones by
+        a foreign key come along. Vanna retrieves related DDL per question the same
+        way; this adds the name and foreign-key signals.
+        """
+        infos = self.db.table_infos()
+        names = list(infos)
+        if len(names) <= self.max_tables:
+            return names
+        text = f"{question}\n{context}".lower()
+        score = {n: 0.0 for n in names}
+        for n in names:
+            if re.search(rf"(?<![a-z0-9_]){re.escape(n.lower())}(?![a-z0-9_])", text):
+                score[n] += 2.0
+        if self.embeddings is not None:
+            if self._table_vectors is None:
+                self._table_vectors = dict(zip(names, self.embeddings.embed_documents([infos[n] for n in names])))
+            q = self.embeddings.embed_query(question)
+            for n, v in self._table_vectors.items():
+                score[n] += _cosine(q, v)
+        else:  # no embeddings: share of the question's words found in the table's DDL
+            words = set(re.findall(r"[a-z0-9_]{3,}", question.lower()))
+            for n in names:
+                if words:
+                    score[n] += len(words & set(re.findall(r"[a-z0-9_]{3,}", infos[n].lower()))) / len(words)
+        ranked = sorted(names, key=lambda n: -score[n])
+        top = ranked[: max(1, self.max_tables // 2)]
+        chosen = list(top)
+        for n in top:
+            chosen += sorted(self.db.neighbours(n) - set(chosen))
+        for n in ranked:
+            if len(chosen) >= self.max_tables:
+                break
+            if n not in chosen:
+                chosen.append(n)
+        return chosen[: self.max_tables]
+
+    def schema_text(self, pasted: str = "", question: str = "", context: str = "") -> str:
         parts = []
         if self.db is not None:
-            parts.append(f"-- Live database ({dialect_name(self.dialect)}):\n{self.live_schema()}")
+            infos = self.db.table_infos()
+            shown, used = [], 0
+            for n in self.select_tables(question, context):
+                if shown and used + len(infos[n]) > self.schema_chars:
+                    break
+                shown.append(infos[n])
+                used += len(infos[n])
+            text = "\n\n".join(shown)
+            hidden = len(infos) - len(shown)
+            if hidden:
+                text += f"\n\n-- {hidden} more tables not shown. Ask about them by name to include them."
+            parts.append(f"-- Live database ({dialect_name(self.dialect)}):\n{text}")
         if pasted.strip():
             parts.append(f"-- Provided by the user:\n{pasted.strip()}")
         return "\n\n".join(parts) or "(no schema given: use the table definitions in the context)"
@@ -422,7 +501,10 @@ class SQLAgent:
         if s.get("error"):
             raw = self._fix.invoke({**self._base(s), "sql": s.get("sql", ""), "error": s["error"]})
         else:
-            raw = self._generate.invoke(self._base(s))
+            shots = []
+            for q, sql in s.get("examples") or []:
+                shots += [HumanMessage(q), AIMessage(f"```sql\n{sql}\n```")]
+            raw = self._generate.invoke({**self._base(s), "examples": shots})
         return {"sql": clean_sql(raw), "attempts": attempts, "error": None}
 
     def _node_check(self, s: SQLState) -> dict:
@@ -462,9 +544,19 @@ class SQLAgent:
 
     # -- public -----------------------------------------------------------------------
 
-    def run(self, question: str, context: str = "", schema: str = "") -> SQLResult:
+    def run(
+        self, question: str, context: str = "", schema: str = "", examples: list[tuple[str, str]] | None = None
+    ) -> SQLResult:
+        """``examples`` are golden (question, sql) pairs, shown to the generator as earlier turns."""
         state = self._graph.invoke(
-            {"question": question, "schema": self.schema_text(schema), "context": context, "attempts": 0, "failures": []},
+            {
+                "question": question,
+                "schema": self.schema_text(schema, question, context),
+                "context": context,
+                "examples": list(examples or []),
+                "attempts": 0,
+                "failures": [],
+            },
             {"recursion_limit": 4 * self.max_attempts + 10},
         )
         res = state.get("result")
@@ -498,6 +590,13 @@ class SQLAgent:
 
     def stream_summary(self, r: SQLResult):
         yield from self._summary.stream(self.summary_inputs(r))
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
 
 
 def _db_error(e: Exception) -> str:

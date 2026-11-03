@@ -105,6 +105,8 @@ class Agent:
         self.top_k = top_k
         self.examples_k = examples_k
         self.sql_agent = sql_agent or SQLAgent(llm)
+        if self.sql_agent.embeddings is None:  # reuse the index's embeddings to pick tables in big databases
+            self.sql_agent.embeddings = getattr(vectorstore, "embeddings", None)
         self.max_history_messages = max_history_messages
         self.schema = schema  # DDL / table list pasted by the user
         self.history: list[BaseMessage] = []
@@ -120,7 +122,6 @@ class Agent:
     def refresh(self) -> None:
         """Re-read which kinds of chunk the index holds (call after a sync)."""
         self._categories = None
-        self.sql_agent._schema_cache = None
 
     @property
     def categories(self) -> set[str]:
@@ -260,7 +261,12 @@ class Agent:
                     "paste the tables, or add .sql files with CREATE TABLE statements to the docs folder."
                 )
                 return
-            result = self.sql_agent.run(question, _numbered(context, start) if context else "", self.schema)
+            examples = [
+                (d.metadata["question"], d.page_content.split("SQL:\n", 1)[-1])
+                for d in context
+                if d.metadata.get("category") == "example" and d.metadata.get("question")
+            ]
+            result = self.sql_agent.run(question, _numbered(context, start) if context else "", self.schema, examples)
             yield result
             summary_tokens = []
             if result.ok and result.executed:
