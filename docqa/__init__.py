@@ -6,17 +6,36 @@ from .config import Settings
 from .indexing import open_vectorstore, sync_documents
 
 __all__ = [
-    "Agent", "Answer", "DocQA", "NOT_FOUND", "Settings", "build_agent", "build_sql_agent",
+    "Agent", "Answer", "DocQA", "NOT_FOUND", "Settings", "build_agent", "build_sql_agent", "open_catalog",
     "format_docs", "open_vectorstore", "sync_documents",
 ]
 
 
-def build_sql_agent(settings: Settings, llm=None):
-    """The SQL specialist, with a read-only database connection when DOCQA_DATABASE_URL is set."""
+def open_catalog(settings: Settings, embeddings=None, use_embeddings: bool = True):
+    """The folder of SQLite databases in DOCQA_DATABASE_DIR, with cached routing cards."""
+    from .multidb import DatabaseCatalog
+    from .providers import make_embeddings
+
+    if use_embeddings and embeddings is None and settings.embed_provider:
+        embeddings = make_embeddings(settings)
+    return DatabaseCatalog(
+        settings.database_dir,
+        embeddings=embeddings if use_embeddings else None,
+        cache_dir=settings.data_dir,
+        cache_key=f"{settings.embed_provider}:{settings.embed_model}" if use_embeddings else "no-embeddings",
+    )
+
+
+def build_sql_agent(settings: Settings, llm=None, catalog=None):
+    """The SQL specialist: one read-only database (DOCQA_DATABASE_URL) or a folder of them (DOCQA_DATABASE_DIR)."""
     from .providers import make_llm
     from .sql import SQLAgent, open_database
 
-    db = open_database(settings.database_url, settings.sql_tables) if settings.database_url else None
+    if settings.database_dir is not None and catalog is None:
+        catalog = open_catalog(settings)
+    db = None
+    if catalog is None and settings.database_url:
+        db = open_database(settings.database_url, settings.sql_tables)
     return SQLAgent(
         llm or make_llm(settings),
         db,
@@ -26,6 +45,9 @@ def build_sql_agent(settings: Settings, llm=None):
         schema_linking=settings.sql_schema_linking,
         max_tables=settings.sql_max_tables,
         schema_chars=settings.sql_schema_chars,
+        catalog=catalog,
+        db_router=settings.sql_db_router,
+        db_candidates=settings.sql_db_candidates,
     )
 
 

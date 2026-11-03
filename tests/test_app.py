@@ -50,3 +50,37 @@ def test_sync_then_sql_question_shows_query_and_table(app):
     save[0].click().run()
     golden = (ws["docs"] / "golden_queries.sql").read_text(encoding="utf-8")
     assert "-- Question: Rank customers by net revenue" in golden
+
+
+def test_folder_of_databases_routes_each_question(tmp_path, monkeypatch):
+    import sqlite3
+
+    import streamlit as st
+
+    for name, script in {
+        "shop": "CREATE TABLE orders (id INTEGER, amount REAL); INSERT INTO orders VALUES (1, 9.5), (2, 20);",
+        "zoo": "CREATE TABLE animals (id INTEGER, species TEXT); INSERT INTO animals VALUES (1, 'lion');",
+    }.items():
+        (tmp_path / "dbs" / name).mkdir(parents=True)
+        conn = sqlite3.connect(tmp_path / "dbs" / name / f"{name}.sqlite")
+        conn.executescript(script)
+        conn.close()
+    (tmp_path / "docs").mkdir()
+    monkeypatch.setenv("DOCQA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DOCQA_DB_ROUTER", "retrieval")
+    monkeypatch.setenv("DOCQA_SQL_SCHEMA_LINKING", "0")
+    monkeypatch.setattr(docqa.indexing, "make_embeddings", lambda s: DeterministicFakeEmbedding(size=32))
+    monkeypatch.setattr("docqa.providers.make_embeddings", lambda s: DeterministicFakeEmbedding(size=32))
+    llm = FakeListChatModel(responses=["SELECT species FROM animals", "One lion."])
+    monkeypatch.setattr("docqa.providers.make_llm", lambda s: llm)
+    monkeypatch.setattr(sys, "argv", ["app.py", "--env-file", "none", "--docs", str(tmp_path / "docs"),
+                                      "--db", str(tmp_path / "dbs")])
+    st.cache_resource.clear()
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    assert not at.exception
+    at.chat_input[0].set_value("Which animals species live in the zoo?").run()
+    assert not at.exception
+    text = " ".join(m.value for m in at.markdown)
+    assert "Database: **zoo**" in text and "One lion." in text
+    st.cache_resource.clear()

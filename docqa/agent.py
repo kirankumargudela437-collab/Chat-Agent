@@ -140,7 +140,7 @@ class Agent:
     def available_routes(self) -> list[str]:
         cats = self.categories
         out = []
-        if self.sql_agent.db is not None or self.schema.strip() or cats & {"sql", "example"}:
+        if self.sql_agent.db is not None or self.sql_agent.catalog is not None or self.schema.strip() or cats & {"sql", "example"}:
             out.append("SQL")
         if "code" in cats:
             out.append("CODE")
@@ -220,6 +220,19 @@ class Agent:
 
         agent = self.sql_agent
         r = SQLResult(question=f"/run {sql}", sql=sql.strip(), dialect=agent.dialect, attempts=1)
+        if agent.catalog is not None:  # many databases: "/run @name SELECT ..." or the last one used
+            m = re.match(r"^\s*@(\S+)\s+(.+)$", sql, re.DOTALL)
+            if m:
+                name, sql = m.group(1), m.group(2)
+                r.sql = sql.strip()
+                if name not in agent.catalog:
+                    r.error = f"Unknown database {name!r}."
+                    return r
+                agent.use_database(name)
+            elif not agent.database_name:
+                r.error = "Several databases are connected: start with @<database>, e.g. /run @concert_singer SELECT ..."
+                return r
+            r.database = agent.database_name
         try:
             r.sql = check_read_only(sql, agent.dialect)
             if agent.db is None:
@@ -302,6 +315,7 @@ class Agent:
             docs.extend(context)
             has_schema = (
                 self.sql_agent.db is not None
+                or self.sql_agent.catalog is not None
                 or self.schema.strip()
                 or any(d.metadata.get("category") in ("sql", "example") for d in context)
                 or any(_MENTIONS_TABLES.search(d.page_content) for d in context)  # e.g. a data dictionary PDF

@@ -35,9 +35,26 @@ def _args() -> argparse.Namespace:
 def _settings(env_file: str, docs_dir: str, db_url: str, dialect: str) -> Settings:
     s = Settings.from_env(env_file)
     s.docs_dir = Path(docs_dir)
+    if db_url and _is_folder(db_url):  # a folder of SQLite files: each question goes to the best match
+        s.database_dir, s.database_url, s.sql_dialect = Path(db_url), None, "sqlite"
+        return s
+    s.database_dir = None
     s.database_url = db_url or None
     s.sql_dialect = dialect_from_url(db_url) if db_url else dialect
     return s
+
+
+def _is_folder(value: str) -> bool:
+    return "://" not in value and Path(value).expanduser().is_dir()
+
+
+@st.cache_resource(show_spinner=False)
+def _catalog(env_file: str, folder: str):
+    from docqa import open_catalog
+
+    s = Settings.from_env(env_file)
+    s.database_dir = Path(folder)
+    return open_catalog(s)
 
 
 @st.cache_resource(show_spinner=False)
@@ -65,10 +82,12 @@ def _agent(env_file: str, docs_dir: str, db_url: str, dialect: str, schema: str)
     if st.session_state.get("agent_key") != key:
         llm = _llm(env_file)
         vs, _ = _index(env_file, docs_dir)
-        db = _database(db_url, s.sql_tables) if db_url else None
+        catalog = _catalog(env_file, str(s.database_dir)) if s.database_dir is not None else None
+        db = _database(db_url, s.sql_tables) if s.database_url else None
         sql = SQLAgent(llm, db, dialect=s.sql_dialect, max_attempts=s.sql_max_attempts,
                        max_rows=s.sql_max_rows, schema_linking=s.sql_schema_linking,
-                       max_tables=s.sql_max_tables, schema_chars=s.sql_schema_chars)
+                       max_tables=s.sql_max_tables, schema_chars=s.sql_schema_chars,
+                       catalog=catalog, db_router=s.sql_db_router, db_candidates=s.sql_db_candidates)
         st.session_state.agent = Agent(llm, vs, top_k=s.top_k, sql_agent=sql, hybrid=s.hybrid_search)
         st.session_state.agent_key = key
         st.session_state.messages = []
@@ -111,9 +130,10 @@ def main() -> None:
         st.caption(f"Chat: {base.llm_provider}:{base.llm_model} · Embeddings: {base.embed_provider}:{base.embed_model}")
         docs_dir = st.text_input("Files folder", value=str(args.docs or base.docs_dir))
         db_url = st.text_input(
-            "Database URL (optional, opened read-only)",
-            value=args.db or base.database_url or "",
-            placeholder="sqlite:///my_company.db or postgresql://user:pass@host/db",
+            "Database URL or folder of SQLite files (optional, opened read-only)",
+            value=args.db or base.database_url or (str(base.database_dir) if base.database_dir else ""),
+            placeholder="sqlite:///my_company.db, postgresql://user:pass@host/db, or benchmarks/spider/spider_data/database",
+            help="A folder of SQLite files (like Spider's database/ folder) routes each question to the best database.",
         )
         default_dialect = base.sql_dialect if base.sql_dialect in DIALECTS else "postgres"
         dialect = st.selectbox(
