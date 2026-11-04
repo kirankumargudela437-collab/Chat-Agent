@@ -59,6 +59,7 @@ def build_sql_agent(settings: Settings, llm=None, catalog=None):
         independent_plans=settings.sql_independent_plans,
         schema_ttl=settings.sql_schema_ttl,
         answer_shape=settings.sql_answer_shape,
+        grain_plan=settings.sql_grain_plan,
     )
 
 

@@ -275,6 +275,7 @@ def cmd_eval(args) -> int:
             review=s.sql_review or args.review,
             independent_plans=s.sql_independent_plans or args.independent,
             answer_shape=s.sql_answer_shape and not args.no_shape,
+            grain_plan=s.sql_grain_plan or args.grain,
         )
         bank = None
         if args.shots:
@@ -313,7 +314,7 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'docs_full': args.docs_full, 'checks': s.sql_answer_checks and not args.no_checks, 'review': s.sql_review or args.review, 'independent': s.sql_independent_plans or args.independent, 'shape': s.sql_answer_shape and not args.no_shape, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'docs_full': args.docs_full, 'checks': s.sql_answer_checks and not args.no_checks, 'review': s.sql_review or args.review, 'independent': s.sql_independent_plans or args.independent, 'shape': s.sql_answer_shape and not args.no_shape, 'grain': s.sql_grain_plan or args.grain, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
@@ -358,6 +359,56 @@ def cmd_replay_repair(args) -> int:
             print(f"[{n}] {qid} {mark} repairs={r['repairs']} {r['seconds']:.1f}s", flush=True)
     print(f"\n{n} replayed: {rejected} rejected by the database on the first attempt, "
           f"{rejected - still} run after repair, {still} still fail. Score {out} with your own scorer.")
+    return 0
+
+
+def cmd_connected_run(args) -> int:
+    """Generate every question afresh on a read-only database, with the replay-repair settings
+    (database errors only, up to --max-repairs). ``--grain`` is the only switch between a
+    control run and a grain run, so a gain is measured on equal terms."""
+    import json as _json
+    import os as _os
+
+    from .benchmark import read_ids
+    from .providers import make_llm
+    from .sql import SQLAgent, open_database
+
+    if args.env_file:
+        from dotenv import load_dotenv
+
+        load_dotenv(args.env_file, override=False)
+    s = Settings.from_env()
+    db = open_database(f"sqlite:///{Path(args.db).resolve()}") if "://" not in args.db else open_database(args.db)
+    agent = SQLAgent(make_llm(s), db=db, max_attempts=1 + args.max_repairs, schema_linking=True,
+                     value_lookup=False, sql_patterns=s.sql_patterns and not args.no_patterns,
+                     answer_checks=False, review=False, grain_plan=args.grain)
+    schema = Path(args.schema).read_text(encoding="utf-8") if args.schema else ""
+    rules = Path(args.rules).read_text(encoding="utf-8") if args.rules else ""
+    keep = set(read_ids(args.ids)) if args.ids else None
+    rows = [_json.loads(x) for x in Path(args.questions).read_text(encoding="utf-8").splitlines() if x.strip()]
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    print(f"model {s.llm_provider}:{s.llm_model} temperature {_os.getenv('DOCQA_TEMPERATURE', 'default')} "
+          f"grain {args.grain}", flush=True)
+    n = 0
+    with open(out, "w", encoding="utf-8") as fh:
+        for row in rows:
+            qid = str(row.get("id") or row.get("question_id"))
+            if keep is not None and qid not in keep:
+                continue
+            start = time.monotonic()
+            r = agent.run(row["question"], context=rules, schema=schema)
+            n += 1
+            rec = {"id": qid, "question": row["question"], "pred_sql": r.sql, "executed": r.ok,
+                   "error": r.error or "", "attempts": r.attempts,
+                   "rechecks": [e for _, e in r.failures if e.startswith("Answer check")] if r.failures else [],
+                   "errors": [e for _, e in r.failures], "mapping": r.mapping,
+                   "seconds": round(time.monotonic() - start, 2)}
+            # only what the agent produced: no gold SQL, no expected rows (they stay with the scorer)
+            fh.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            print(f"[{n}] {qid} {'ok' if r.ok else 'fails'} attempts={r.attempts} {rec['seconds']:.1f}s", flush=True)
+    print(f"\n{n} questions written to {out}. Score it with your own scorer.")
     return 0
 
 
@@ -467,6 +518,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "technique on every question (the round 5b behaviour)")
     ev.add_argument("--no-checks", action="store_true", help="don't EXPLAIN first or re-ask on suspicious results "
                     "(empty, all NULL, duplicated rows, percentage outside 0-100)")
+    ev.add_argument("--grain", action="store_true", help="plan the grain and check LEFT JOIN filters and "
+                    "multiplying joins (default DOCQA_SQL_GRAIN=0)")
     ev.add_argument("--no-shape", action="store_true", help="the plan does not state the answer shape "
                     "(row entity, measure, denominator, ties); with --no-checks this isolates the schema fix")
     ev.add_argument("--independent", action="store_true", help="with --sql-candidates N: each extra candidate "
@@ -491,6 +544,20 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("--no-patterns", action="store_true", help="match a run that had the SQL patterns off")
     rr.add_argument("--out", required=True)
     rr.set_defaults(func=cmd_replay_repair)
+
+    cr = sub.add_parser("connected-run", help="answer every question afresh on a read-only database with "
+                        "the replay-repair settings; --grain switches the grain plan and checks on")
+    cr.add_argument("--db", required=True, help="SQLite file (opened read-only) or a database URL")
+    cr.add_argument("--questions", required=True, help="JSONL with id and question (extra fields are ignored)")
+    cr.add_argument("--schema", help="schema text to give the model (default: read from the database)")
+    cr.add_argument("--rules", help="business rules / context to give the model")
+    cr.add_argument("--ids", help="only these question ids (e.g. the 80 diagnostic ones)")
+    cr.add_argument("--max-repairs", type=int, default=2)
+    cr.add_argument("--grain", action="store_true", help="grain plan, key paths and the two grain checks")
+    cr.add_argument("--no-patterns", action="store_true")
+    cr.add_argument("--env-file", help="load settings (model, temperature) from this .env first")
+    cr.add_argument("--out", required=True)
+    cr.set_defaults(func=cmd_connected_run)
 
     fr = sub.add_parser("failures", help="label SQL failures across runs (from results + DOCQA_TRACE_FILE traces)")
     fr.add_argument("--run", action="append", required=True,

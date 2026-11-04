@@ -306,3 +306,181 @@ def missing_values(db, sql: str, dialect: str, max_values: int = 40, timeout: fl
             _guard(conn, None)
             conn.rollback()
     return out
+
+
+# -- grain: joins that multiply rows, and LEFT JOINs undone by WHERE ---------------------
+
+
+def relations(db) -> list[tuple[str, str, str, str]]:
+    """``(child, child_column, parent, parent_column)`` for every key between two tables.
+
+    Declared foreign keys first; a table that declares none is linked by name: a column
+    that is the whole primary key of another table (``order_id`` in ``payments`` when
+    ``orders`` has primary key ``order_id``)."""
+    md = db._metadata.tables
+    out = []
+    pk_of = {}
+    for name, t in md.items():
+        cols = [c.name for c in t.primary_key.columns]
+        if len(cols) == 1:
+            pk_of.setdefault(cols[0].lower(), []).append(name)
+    for name, t in md.items():
+        fks = sorted(t.foreign_keys, key=lambda fk: (fk.parent.name, fk.column.table.name))
+        for fk in fks:
+            out.append((name, fk.parent.name, fk.column.table.name, fk.column.name))
+        if fks:
+            continue
+        own = {c.name.lower() for c in t.primary_key.columns}
+        for c in t.columns:
+            if c.name.lower() in own and len(own) == 1:
+                continue
+            for parent in pk_of.get(c.name.lower(), []):
+                if parent != name:
+                    out.append((name, c.name, parent, c.name))
+    return list(dict.fromkeys(out))
+
+
+def _unique_cols(db, table: str) -> set[str]:
+    t = db._metadata.tables.get(table)
+    if t is None:
+        return set()
+    out = set()
+    pk = [c.name.lower() for c in t.primary_key.columns]
+    if len(pk) == 1:
+        out.add(pk[0])
+    for con in getattr(t, "constraints", ()):
+        cols = [c.name.lower() for c in getattr(con, "columns", ())]
+        if type(con).__name__ == "UniqueConstraint" and len(cols) == 1:
+            out.add(cols[0])
+    for ix in getattr(t, "indexes", ()):
+        cols = [c.name.lower() for c in ix.columns]
+        if ix.unique and len(cols) == 1:
+            out.add(cols[0])
+    return out
+
+
+def join_paths(db, tables: list[str] | None = None) -> str:
+    """The key paths between ``tables`` (all tables when None), one line each, and a warning
+    where one table has two keys to the same table (two roles: who ordered and who pays):
+    the database cannot say which one a question means, so the plan has to."""
+    rels = relations(db)
+    keep = set(tables) if tables else None
+    lines, roles = [], {}
+    for child, ccol, parent, pcol in rels:
+        if keep is not None and not (child in keep and parent in keep):
+            continue
+        many = ccol.lower() not in _unique_cols(db, child)
+        lines.append(f"{child}.{ccol} = {parent}.{pcol}  ({'many' if many else 'one'} {child} per {parent})")
+        roles.setdefault((child, parent), []).append(ccol)
+    for (child, parent), cols in roles.items():
+        if len(cols) > 1:
+            lines.append(f"{child} has {len(cols)} keys to {parent} ({', '.join(cols)}): each is a different "
+                         f"role; use the one the question means, and join {parent} once per role it needs.")
+    return "\n".join(lines)
+
+
+def _conjuncts(node):
+    from sqlglot import exp
+
+    if isinstance(node, exp.And):
+        return _conjuncts(node.left) + _conjuncts(node.right)
+    if isinstance(node, exp.Paren):
+        return _conjuncts(node.this)
+    return [node]
+
+
+def _keeps_nulls(cond, alias: str) -> bool:
+    """True when the condition still lets the unmatched (all-NULL) rows of ``alias`` through:
+    ``x IS NULL``, ``... OR x IS NULL``, ``COALESCE(x, ..)``, ``IFNULL``/``NVL``."""
+    from sqlglot import exp
+
+    for n in cond.find_all(exp.Is):
+        if isinstance(n.expression, exp.Null) or isinstance(n.this, exp.Null):
+            return True
+    for n in cond.find_all(exp.Coalesce):
+        return True
+    return any(n.sql().lower().startswith(("ifnull(", "nvl(", "isnull(")) for n in cond.find_all(exp.Anonymous))
+
+
+def optional_side_filters(sql: str, dialect: str, db=None) -> list[tuple[str, str]]:
+    """``(condition, table)`` for each WHERE condition on the optional (right) side of a LEFT
+    JOIN. ``WHERE p.status = 'Settled'`` after ``LEFT JOIN payments p`` drops every row that
+    had no payment, so the LEFT JOIN quietly becomes an INNER JOIN."""
+    from sqlglot import exp
+
+    tree = _parse(sql, dialect)
+    if tree is None:
+        return []
+    md = db._metadata.tables if db is not None else {}
+    found = []
+    for select in tree.find_all(exp.Select):
+        optional: dict[str, str] = {}
+        for join in select.args.get("joins") or []:
+            if (join.side or "").upper() != "LEFT":
+                continue
+            src = join.this
+            alias = (src.alias_or_name or "").lower()
+            if alias:
+                optional[alias] = src.name if isinstance(src, exp.Table) else alias
+        where = select.args.get("where")
+        if not optional or where is None:
+            continue
+        for cond in _conjuncts(where.this):
+            hits = set()
+            for col in cond.find_all(exp.Column):
+                if col.find_ancestor(exp.Select) is not select:
+                    continue  # inside a subquery of the condition
+                t = (col.table or "").lower()
+                if t in optional:
+                    hits.add(t)
+                elif not t and md:  # unqualified: the optional table owns it and no other table does
+                    owners = [a for a, name in optional.items() if name in md and col.name in md[name].columns]
+                    if len(owners) == 1:
+                        hits.add(owners[0])
+            for alias in hits:
+                if not _keeps_nulls(cond, alias):
+                    found.append((cond.sql(dialect=dialect), optional[alias]))
+    return list(dict.fromkeys(found))
+
+
+
+def fanout_joins(db, sql: str, dialect: str) -> list[tuple[str, str, str]]:
+    """``(table_a, table_b, parent)`` where one SELECT aggregates (SUM/AVG/COUNT) over a join of
+    two tables that each have several rows per the same parent: each row of one is repeated
+    for every matching row of the other, so totals are multiplied. Totalling each table per
+    parent key in its own CTE first avoids it."""
+    from sqlglot import exp
+
+    tree = _parse(sql, dialect)
+    if tree is None or db is None:
+        return []
+    ctes = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
+    many = {}  # (child, parent) -> child column, for keys with several child rows per parent
+    for child, ccol, parent, _ in relations(db):
+        if ccol.lower() not in _unique_cols(db, child):
+            many.setdefault((child, parent), ccol)
+    found = []
+    for select in tree.find_all(exp.Select):
+        aggs = [a for a in select.find_all(exp.Sum, exp.Avg, exp.Count)
+                if a.find_ancestor(exp.Select) is select
+                and not (isinstance(a, exp.Count) and isinstance(a.this, exp.Distinct))]
+        if not aggs:
+            continue
+        sources = []
+        frm = select.args.get("from")
+        if frm is not None:
+            sources.append(frm.this)
+        sources += [j.this for j in select.args.get("joins") or []]
+        tables = [s.name for s in sources if isinstance(s, exp.Table) and s.name.lower() not in ctes]
+        on_cols = {c.name.lower() for j in select.args.get("joins") or [] if j.args.get("on") is not None
+                   for c in j.args["on"].find_all(exp.Column)}
+        for i, a in enumerate(tables):
+            for b in tables[i + 1:]:
+                if a == b or (a, b) in many or (b, a) in many:
+                    continue  # parent and child: the normal one-to-many join
+                for (child, parent) in many:
+                    # siblings joined through that parent's key (not two tables that merely share a dimension)
+                    if child == a and (b, parent) in many and many[(a, parent)].lower() in on_cols \
+                            and many[(b, parent)].lower() in on_cols:
+                        found.append((a, b, parent))
+    return list(dict.fromkeys(found))

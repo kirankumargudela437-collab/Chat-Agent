@@ -45,8 +45,8 @@ from typing import Any, Optional, TypedDict
 import sqlglot
 from sqlglot import exp
 
-from .sqlchecks import (REVIEW_PROMPT, dry_run, join_keys, missing_values, parse_review, result_problems,
-                        self_comparisons, tables_in)
+from .sqlchecks import (REVIEW_PROMPT, dry_run, fanout_joins, join_keys, join_paths, missing_values,
+                        optional_side_filters, parse_review, result_problems, self_comparisons, tables_in)
 from .trace import set_question, set_step
 from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
 from langchain_core.language_models import BaseChatModel
@@ -396,6 +396,7 @@ _RULES = (
     "- For 'not / never / without' questions use NOT IN or EXCEPT, not != on a join.\n"
     "- For the row with the highest / lowest / latest value ('the most recent order'), use {top_one}; "
     "when every tied row should be returned, compare with a subquery (= (SELECT MAX(...) ...)) instead.\n"
+    "{grain_rule}"
     "- Follow the style of the golden examples when one is similar, but use the column names of THIS schema.\n"
     "- Unless the question asks for everything, return at most {max_rows} rows.\n"
     "- Output only the SQL in one ```sql block, no explanation."
@@ -410,6 +411,25 @@ ANSWER_SHAPE = (
     "one player's score, not MAX(long passing) over all players.\n"
 )
 
+GRAIN_PLAN = (
+    "- Grain: what one counted or summed thing is (one order, one payment, one returned line: "
+    "decide it from the question, it is not always the main table) and its key column. For every "
+    "other table, say whether it has one row or several rows per that thing; joining a table with "
+    "several rows repeats the thing, so plan a CTE that totals that table per key first, and join "
+    "the totals. Say which rows must survive even with no match (LEFT JOIN, missing totals as "
+    "COALESCE(total, 0)), and where each status, date or type condition belongs: inside the CTE of "
+    "the table it filters, or in the LEFT JOIN's ON clause, never in WHERE on the optional side. "
+    "Classify, rank or count only after the one-row-per-thing result exists.\n"
+    "- Roles: when a table has two keys to the same table (who ordered, who is billed), say which "
+    "one the question means.\n"
+)
+
+GRAIN_RULE = (
+    "- Follow the grain in the mapping: total each table that has several rows per counted thing in "
+    "its own CTE, grouped by that thing's key, then join the CTEs. A condition on the optional side "
+    "of a LEFT JOIN goes in its CTE or in the ON clause, not in WHERE.\n"
+)
+
 LINK_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
@@ -420,13 +440,14 @@ LINK_PROMPT = ChatPromptTemplate.from_messages(
             "- Columns and rules: how each business term in the question maps to columns, filters, "
             "status codes or formulas, citing the passage as [n].\n"
             "{shape}"
+            "{grain}"
             "- Gaps: anything the question needs that the schema and context do not define.\n"
             "Do not write the SQL. Be concise.{hint}\n\n"
-            "Dialect: {dialect_name}\n\nSchema:\n{schema}\n\nContext:\n{context}",
+            "Dialect: {dialect_name}\n\nSchema:\n{schema}{paths}\n\nContext:\n{context}",
         ),
         ("human", "{question}"),
     ]
-)
+).partial(grain="", paths="")  # off unless grain_plan
 
 GENERATE_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -441,7 +462,7 @@ GENERATE_PROMPT = ChatPromptTemplate.from_messages(
         MessagesPlaceholder("examples", optional=True),
         ("human", "{question}"),
     ]
-)
+).partial(grain_rule="")  # off unless grain_plan
 
 FIX_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -454,7 +475,7 @@ FIX_PROMPT = ChatPromptTemplate.from_messages(
         ),
         ("human", "Question: {question}\n\nFailed SQL:\n```sql\n{sql}\n```\n\nError: {error}\n\nCorrected SQL:"),
     ]
-)
+).partial(grain_rule="")  # off unless grain_plan
 
 SUMMARY_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -489,6 +510,7 @@ class SQLState(TypedDict, total=False):
     checked: list
     fallback: Optional[dict]
     reviewed: bool
+    paths: str
 
 
 @dataclass
@@ -546,6 +568,7 @@ class SQLAgent:
         independent_plans: bool = False,
         schema_ttl: float = 0.0,
         answer_shape: bool = True,
+        grain_plan: bool = False,
         tracer=None,
     ):
         """``catalog`` (a ``multidb.DatabaseCatalog``) routes each question to one of many databases."""
@@ -581,6 +604,7 @@ class SQLAgent:
         self.review = review  # the model reviews its own query and first rows (one extra call)
         self.independent_plans = independent_plans  # each extra candidate plans the question afresh
         self.answer_shape = answer_shape  # the plan states what one result row is (entity, measure, ...)
+        self.grain_plan = grain_plan  # plan the counted thing, multiplying joins and surviving rows; check them
         self.schema_ttl = schema_ttl  # seconds before the live schema is read again (0: once per session)
         self._schema_loaded = time.monotonic()
         self.error_help = None  # (error, sql) -> manual text shown when fixing a failed query
@@ -715,6 +739,9 @@ class SQLAgent:
             "dialect_name": dialect_name(self.dialect),
             "top_one": top_one(self.dialect),
             "shape": ANSWER_SHAPE if self.answer_shape else "",
+            "grain": GRAIN_PLAN if self.grain_plan else "",
+            "grain_rule": GRAIN_RULE if self.grain_plan else "",
+            "paths": s.get("paths", ""),
             "max_rows": self.max_rows,
             "schema": s["schema"],
             "context": s.get("context") or "(none)",
@@ -795,8 +822,10 @@ class SQLAgent:
         if prev and _norm_sql(prev) == _norm_sql(sql):  # the model stands by its query: accept it
             return ok
         problem = None
-        if self.answer_checks:
-            seen = s.get("checked") or []
+        seen = s.get("checked") or []
+        if self.grain_plan:
+            problem = self._grain_problem(sql, seen)
+        if problem is None and self.answer_checks:
             if "values" not in seen:  # a text filter on a value the column never holds
                 missing = missing_values(self.db, sql, self.dialect)
                 if missing:
@@ -823,6 +852,28 @@ class SQLAgent:
                    # the first query that ran is kept if the re-ask does no better
                    fallback=s.get("fallback") or {"sql": sql, "result": res})
         return out
+
+    def _grain_problem(self, sql: str, seen: list) -> tuple[str, str] | None:
+        """A LEFT JOIN undone by WHERE, or totals multiplied by joining two many-row tables."""
+        if "optional_side" not in seen:
+            hits = optional_side_filters(sql, self.dialect, self.db)
+            if hits:
+                cond, table = hits[0]
+                return ("optional_side", f"The condition {cond} is in WHERE, but {table} is on the optional "
+                        f"side of a LEFT JOIN, so every row with no matching {table} row is dropped and the "
+                        "LEFT JOIN acts as an inner join. Move the condition into the CTE that builds "
+                        f"{table}, or into the ON clause. If dropping those rows is what the question "
+                        "asks, return the same query unchanged.")
+        if "fanout" not in seen and self.db is not None:
+            hits = fanout_joins(self.db, sql, self.dialect)
+            if hits:
+                a, b, parent = hits[0]
+                return ("fanout", f"{a} and {b} both have several rows per {parent}, and this query joins "
+                        "both before aggregating, so each row of one is repeated for every matching row "
+                        f"of the other and the totals are multiplied. Total each of them per {parent} key "
+                        "in its own CTE, then join the totals. If the totals are already right, return "
+                        "the same query unchanged.")
+        return None
 
     def _fail(self, s: SQLState, error: str) -> dict:
         log.info("SQL attempt %s failed: %s", s.get("attempts"), error)
@@ -888,6 +939,7 @@ class SQLAgent:
         }
         if _ASKS_FOR_ALL.search(question):
             base["hint"] = ALL_INFO_HINT
+        base["paths"] = self._paths_text()
         limit = {"recursion_limit": 4 * self.max_attempts + 10}
         set_step("", candidate=0)
         states = [_settle(self._graph.invoke(base, limit))]
@@ -957,6 +1009,17 @@ class SQLAgent:
         if self.tracer is not None:
             self.tracer.event("replay", **{k: v for k, v in out.items() if k != "question"})
         return out
+
+    def _paths_text(self) -> str:
+        """Key paths between the tables in the prompt, for the grain plan (empty when it is off)."""
+        if not self.grain_plan or self.db is None:
+            return ""
+        try:
+            text = join_paths(self.db, list(self.last_schema) or None)
+        except Exception as e:  # pragma: no cover - odd metadata must not break a question
+            log.debug("join paths failed: %s", e)
+            return ""
+        return f"\n\nKey paths (from the database):\n{text}" if text else ""
 
     def _with_patterns(self, question: str, context: str) -> str:
         """Append the SQL techniques that fit the question, with worked examples."""
@@ -1166,6 +1229,7 @@ def _run_settings(llm, agent) -> dict:
         "patterns": agent._patterns is not None,
         "answer_checks": agent.answer_checks,
         "answer_shape": agent.answer_shape,
+        "grain_plan": agent.grain_plan,
     }
 
 

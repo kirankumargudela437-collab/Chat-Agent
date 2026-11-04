@@ -426,6 +426,22 @@ on a read-only database: a query that runs is kept exactly as saved; one the dat
 to the model with the real error (plus the identifier and alias hints) for up to `--max-repairs`
 corrections. No expected rows or answer key reach the agent; score the output with your own scorer.
 
+**Grain and joins** (`DOCQA_SQL_GRAIN=1`, `docqa eval --grain`, off by default until measured). The
+plan names what one counted thing is (an order, a payment, a returned line: taken from the question),
+which tables have several rows per that thing and must be totalled per key in their own CTE before
+joining, which rows must survive (LEFT JOIN, missing totals as zero), and where each status or date
+condition belongs. The planner also sees the key paths between the tables, read from the foreign keys
+(or matching key names), with a note when one table has two keys to the same table (two roles, such as
+who ordered and who is billed): the question decides which. Two checks send a query back once (a query
+returned unchanged is accepted): a WHERE condition on the optional side of a LEFT JOIN, which drops the
+unmatched rows, and a SUM/AVG/COUNT over two tables that both have several rows per the same parent and
+are joined through its key, which multiplies the totals.
+
+`docqa connected-run --db northstar.sqlite --questions questions.jsonl --schema schema.sql --rules
+business_rules.md --ids diag80.txt --max-repairs 2 [--grain] --out G1.jsonl` answers every question afresh
+with the replay-repair settings (database errors only, no answer key); `--grain` is the only difference
+between a control run and a grain run.
+
 For a fair comparison, freeze question sets: `--save-ids` writes the chosen ids, `--ids` runs
 exactly those, and `--exclude-ids` keeps the regression questions out of an unseen set:
 `docqa eval bird --exclude-ids regression30.txt --limit 60 --seed 1 --save-ids unseen60.txt`.
