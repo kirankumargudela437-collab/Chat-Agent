@@ -45,7 +45,7 @@ from typing import Any, Optional, TypedDict
 import sqlglot
 from sqlglot import exp
 
-from .sqlchecks import (REVIEW_PROMPT, dry_run, fanout_joins, join_keys, join_paths, missing_values,
+from .sqlchecks import (REVIEW_PROMPT, dry_run, fanout_joins, fanout_shape, join_keys, join_paths, missing_values,
                         optional_side_filters, parse_review, result_problems, self_comparisons, tables_in)
 from .trace import set_question, set_step
 from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
@@ -511,6 +511,7 @@ class SQLState(TypedDict, total=False):
     fallback: Optional[dict]
     reviewed: bool
     paths: str
+    bonus: int
 
 
 @dataclass
@@ -816,15 +817,20 @@ class SQLAgent:
     def _checked(self, s: SQLState, sql: str, res: QueryResult) -> dict:
         """A query that ran: accept it, or send it back once per kind of suspicious result."""
         ok = {"sql": sql, "result": res, "executed": True}
-        if s.get("attempts", 0) >= self.max_attempts:
-            return ok
         prev = (s.get("fallback") or {}).get("sql")
         if prev and _norm_sql(prev) == _norm_sql(sql):  # the model stands by its query: accept it
             return ok
         problem = None
         seen = s.get("checked") or []
+        # The grain checks have their own budget: when database errors used up the attempts,
+        # a query that runs but multiplies its totals still gets its re-asks.
+        bonus = 0
         if self.grain_plan:
             problem = self._grain_problem(sql, seen)
+            if problem is not None and s.get("attempts", 0) >= self._limit(s):
+                bonus = 1
+        if problem is None and s.get("attempts", 0) >= self._limit(s):
+            return ok
         if problem is None and self.answer_checks:
             if "values" not in seen:  # a text filter on a value the column never holds
                 missing = missing_values(self.db, sql, self.dialect)
@@ -847,7 +853,7 @@ class SQLAgent:
             return ok
         kind, message = problem
         out = self._fail({**s, "sql": sql}, f"Answer check: {message}")
-        out.update(sql=sql, checked=[*(s.get("checked") or []), kind],
+        out.update(sql=sql, checked=[*(s.get("checked") or []), kind], bonus=s.get("bonus", 0) + bonus,
                    reviewed=bool(s.get("reviewed")) or kind == "review",
                    # the first query that ran is kept if the re-ask does no better
                    fallback=s.get("fallback") or {"sql": sql, "result": res})
@@ -864,15 +870,16 @@ class SQLAgent:
                         "LEFT JOIN acts as an inner join. Move the condition into the CTE that builds "
                         f"{table}, or into the ON clause. If dropping those rows is what the question "
                         "asks, return the same query unchanged.")
-        if "fanout" not in seen and self.db is not None:
+        if seen.count("fanout") < 2 and self.db is not None:  # a 7B often just reshuffles its CTEs once
             hits = fanout_joins(self.db, sql, self.dialect)
             if hits:
                 a, b, parent = hits[0]
-                return ("fanout", f"{a} and {b} both have several rows per {parent}, and this query joins "
-                        "both before aggregating, so each row of one is repeated for every matching row "
-                        f"of the other and the totals are multiplied. Total each of them per {parent} key "
-                        "in its own CTE, then join the totals. If the totals are already right, return "
-                        "the same query unchanged.")
+                again = "still " if "fanout" in seen else ""
+                return ("fanout", f"This query {again}joins {a} and {b} in the same SELECT, and both have several "
+                        f"rows per {parent}, so each {a} row is repeated once per matching {b} row and every "
+                        f"SUM or COUNT over them is multiplied. Never join {a} and {b} to each other. Total each "
+                        f"one per {parent} in its own CTE that reads only that table, then join both totals to "
+                        f"{parent}, in this shape:\n" + fanout_shape(self.db, a, b, parent))
         return None
 
     def _fail(self, s: SQLState, error: str) -> dict:
@@ -881,8 +888,11 @@ class SQLAgent:
             self.tracer.event("check", ok=False, attempt=s.get("attempts"), sql=s.get("sql", ""), error=error)
         return {"error": error, "failures": [*s.get("failures", []), (s.get("sql", ""), error)]}
 
+    def _limit(self, s: SQLState) -> int:
+        return self.max_attempts + s.get("bonus", 0)
+
     def _route(self, s: SQLState) -> str:
-        if s.get("error") and s.get("attempts", 0) < self.max_attempts:
+        if s.get("error") and s.get("attempts", 0) < self._limit(s):
             return "retry"
         return "done"
 
@@ -940,7 +950,7 @@ class SQLAgent:
         if _ASKS_FOR_ALL.search(question):
             base["hint"] = ALL_INFO_HINT
         base["paths"] = self._paths_text()
-        limit = {"recursion_limit": 4 * self.max_attempts + 10}
+        limit = {"recursion_limit": 4 * self.max_attempts + 20}
         set_step("", candidate=0)
         states = [_settle(self._graph.invoke(base, limit))]
         if self.sql_candidates > 1 and self.db is not None:

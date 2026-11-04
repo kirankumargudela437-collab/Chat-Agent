@@ -445,26 +445,29 @@ def optional_side_filters(sql: str, dialect: str, db=None) -> list[tuple[str, st
 
 
 def fanout_joins(db, sql: str, dialect: str) -> list[tuple[str, str, str]]:
-    """``(table_a, table_b, parent)`` where one SELECT aggregates (SUM/AVG/COUNT) over a join of
-    two tables that each have several rows per the same parent: each row of one is repeated
-    for every matching row of the other, so totals are multiplied. Totalling each table per
-    parent key in its own CTE first avoids it."""
+    """``(table_a, table_b, parent)`` where a query aggregates (SUM/AVG/COUNT) over a join of two
+    tables that each have several rows per the same parent: each row of one is repeated for
+    every matching row of the other, so totals are multiplied. The join may sit in the SELECT
+    that aggregates or in a CTE that a later SELECT aggregates. Totalling each table per
+    parent key in its own CTE first avoids it. ``fanout_shape`` writes that shape out."""
     from sqlglot import exp
 
     tree = _parse(sql, dialect)
     if tree is None or db is None:
         return []
     ctes = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
-    many = {}  # (child, parent) -> child column, for keys with several child rows per parent
-    for child, ccol, parent, _ in relations(db):
-        if ccol.lower() not in _unique_cols(db, child):
-            many.setdefault((child, parent), ccol)
+    many = _many_keys(db)
+
+    def counts(a) -> bool:
+        return not (isinstance(a, exp.Count) and isinstance(a.this, exp.Distinct))
+
+    any_agg = any(counts(a) for a in tree.find_all(exp.Sum, exp.Avg, exp.Count))
     found = []
     for select in tree.find_all(exp.Select):
-        aggs = [a for a in select.find_all(exp.Sum, exp.Avg, exp.Count)
-                if a.find_ancestor(exp.Select) is select
-                and not (isinstance(a, exp.Count) and isinstance(a.this, exp.Distinct))]
-        if not aggs:
+        own = any(counts(a) and a.find_ancestor(exp.Select) is select
+                  for a in select.find_all(exp.Sum, exp.Avg, exp.Count))
+        in_cte = isinstance(select.parent, exp.CTE)
+        if not (own or (in_cte and any_agg)):
             continue
         sources = []
         frm = select.args.get("from")
@@ -472,15 +475,44 @@ def fanout_joins(db, sql: str, dialect: str) -> list[tuple[str, str, str]]:
             sources.append(frm.this)
         sources += [j.this for j in select.args.get("joins") or []]
         tables = [s.name for s in sources if isinstance(s, exp.Table) and s.name.lower() not in ctes]
-        on_cols = {c.name.lower() for j in select.args.get("joins") or [] if j.args.get("on") is not None
-                   for c in j.args["on"].find_all(exp.Column)}
+        on_cols = set()
+        for j in select.args.get("joins") or []:
+            if j.args.get("on") is not None:
+                on_cols |= {c.name.lower() for c in j.args["on"].find_all(exp.Column)}
+            on_cols |= {u.name.lower() for u in j.args.get("using") or []}
         for i, a in enumerate(tables):
             for b in tables[i + 1:]:
                 if a == b or (a, b) in many or (b, a) in many:
                     continue  # parent and child: the normal one-to-many join
                 for (child, parent) in many:
                     # siblings joined through that parent's key (not two tables that merely share a dimension)
-                    if child == a and (b, parent) in many and many[(a, parent)].lower() in on_cols \
-                            and many[(b, parent)].lower() in on_cols:
+                    if child == a and (b, parent) in many and many[(a, parent)][0].lower() in on_cols \
+                            and many[(b, parent)][0].lower() in on_cols:
                         found.append((a, b, parent))
     return list(dict.fromkeys(found))
+
+
+def _many_keys(db) -> dict[tuple[str, str], tuple[str, str]]:
+    """``(child, parent) -> (child_column, parent_column)`` for keys with several child rows per parent."""
+    many = {}
+    for child, ccol, parent, pcol in relations(db):
+        if ccol.lower() not in _unique_cols(db, child):
+            many.setdefault((child, parent), (ccol, pcol))
+    return many
+
+
+def fanout_shape(db, a: str, b: str, parent: str) -> str:
+    """The query shape that avoids the fan-out, with this schema's table and key names."""
+    many = _many_keys(db)
+    acol, pcol = many[(a, parent)]
+    bcol, _ = many[(b, parent)]
+    return (f"WITH {a}_per_{parent} AS (\n"
+            f"  SELECT {acol}, SUM(<measure from {a}>) AS {a}_total FROM {a}\n"
+            f"  WHERE <conditions on {a} only> GROUP BY {acol}),\n"
+            f"{b}_per_{parent} AS (\n"
+            f"  SELECT {bcol}, SUM(<measure from {b}>) AS {b}_total FROM {b}\n"
+            f"  WHERE <conditions on {b} only> GROUP BY {bcol})\n"
+            f"SELECT ... FROM {parent} p\n"
+            f"LEFT JOIN {a}_per_{parent} x ON x.{acol} = p.{pcol}\n"
+            f"LEFT JOIN {b}_per_{parent} y ON y.{bcol} = p.{pcol}\n"
+            f"WHERE <conditions on {parent}>  -- then use COALESCE(x.{a}_total, 0), COALESCE(y.{b}_total, 0)")

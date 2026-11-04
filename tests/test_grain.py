@@ -148,3 +148,42 @@ def test_connected_run_writes_agent_output_only(tmp_path, monkeypatch, capsys):
     rows = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1 and rows[0]["id"] == "7" and rows[0]["executed"] and "SECRET" not in out.read_text()
     assert rows[0]["pred_sql"].strip().upper().startswith("SELECT COUNT(*)")
+
+
+FAN = ("```sql\nSELECT o.order_id, SUM(l.amount) AS booked, SUM(p.amount) AS paid FROM orders o "
+       "JOIN lines l ON l.order_id = o.order_id LEFT JOIN payments p ON p.order_id = o.order_id "
+       "GROUP BY o.order_id\n```")
+TOTALS = ("```sql\nWITH b AS (SELECT order_id, SUM(amount) s FROM lines GROUP BY order_id), "
+          "c AS (SELECT order_id, SUM(amount) s FROM payments GROUP BY order_id) "
+          "SELECT o.order_id, b.s, COALESCE(c.s, 0) FROM orders o JOIN b ON b.order_id = o.order_id "
+          "LEFT JOIN c ON c.order_id = o.order_id\n```")
+
+
+def test_fanout_inside_a_cte_aggregated_later(tmp_path):
+    db = _shop(tmp_path)
+    sql = ("WITH j AS (SELECT o.order_id, l.amount la, p.amount pa FROM orders o JOIN lines l ON l.order_id = o.order_id "
+           "LEFT JOIN payments p ON p.order_id = o.order_id) SELECT order_id, SUM(la), SUM(pa) FROM j GROUP BY order_id")
+    assert fanout_joins(db, sql, "sqlite") == [("lines", "payments", "orders")]
+    using = ("SELECT SUM(l.amount) FROM orders o JOIN lines l USING (order_id) JOIN payments p USING (order_id)")
+    assert fanout_joins(db, using, "sqlite") == [("lines", "payments", "orders")]
+
+
+def test_fanout_check_runs_after_database_errors_used_the_budget(tmp_path):
+    db = _shop(tmp_path)
+    broken = "```sql\nSELECT nope FROM orders\n```"
+    agent = SQLAgent(FakeListChatModel(responses=["plan", broken, broken, FAN, TOTALS]), db=db, value_lookup=False,
+                     sql_patterns=False, answer_checks=False, grain_plan=True, max_attempts=3)
+    r = agent.run("Booked and paid per order")
+    assert r.attempts == 4 and sorted(r.rows) == [(1, 150, 150), (2, 70, 70), (3, 10, 0)]
+    message = r.failures[-1][1]
+    assert "Never join lines and payments" in message and "lines_per_orders" in message
+    assert "GROUP BY order_id" in message and "return the same query" not in message
+
+
+def test_fanout_check_fires_again_when_the_model_keeps_the_fanout(tmp_path):
+    db = _shop(tmp_path)
+    fan2 = FAN.replace("SUM(p.amount) AS paid", "SUM(p.amount) AS settled")
+    agent = SQLAgent(FakeListChatModel(responses=["plan", FAN, fan2, TOTALS]), db=db, value_lookup=False,
+                     sql_patterns=False, answer_checks=False, grain_plan=True, max_attempts=3)
+    r = agent.run("Booked and paid per order")
+    assert r.attempts == 3 and "still joins" in r.failures[-1][1] and (3, 10, 0) in r.rows
