@@ -478,7 +478,7 @@ def fanout_sites(db, sql: str, dialect: str) -> list[tuple[str, str, str, str, t
         if not (own or (in_cte and any_agg)):
             continue
         sources = []
-        frm = select.args.get("from")
+        frm = (select.args.get("from_") or select.args.get("from"))
         if frm is not None:
             sources.append(frm.this)
         sources += [j.this for j in select.args.get("joins") or []]

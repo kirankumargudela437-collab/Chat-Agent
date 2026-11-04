@@ -48,7 +48,8 @@ from sqlglot import exp
 from .sqlchecks import (REVIEW_PROMPT, counted_group_keys, dry_run, fanout_shape, fanout_sites, join_keys,
                         join_paths, missing_values, optional_side_filters, parse_review, result_problems, self_comparisons, tables_in)
 from .trace import set_question, set_step
-from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
+from .sqlhints import (ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, qualify_ambiguous,
+                       schema_fit)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import AIMessage, HumanMessage
@@ -794,7 +795,12 @@ class SQLAgent:
             res = run_query(self.db, sql, self.max_rows)
         except Exception as e:  # the exact database error drives the next attempt
             error = _db_error(e)
-            fixed = auto_fix_identifiers(self.db, sql, self.dialect) if re.search(r"no such (column|table)", error, re.I) else None
+            if re.search(r"no such (column|table)", error, re.I):
+                fixed = auto_fix_identifiers(self.db, sql, self.dialect)
+            elif re.search(r"ambiguous column", error, re.I):
+                fixed = qualify_ambiguous(self.db, sql, error, self.dialect)
+            else:
+                fixed = None
             if fixed and fixed != sql:  # names that differ only in case/underscores: repaired without a model call
                 try:
                     res = run_query(self.db, fixed, self.max_rows)
@@ -826,8 +832,8 @@ class SQLAgent:
         bonus = 0
         if self.grain_plan:
             problem = self._grain_problem(sql, seen)
-            if problem is not None and s.get("attempts", 0) >= self._limit(s):
-                bonus = 1
+            if problem is not None:  # the rewrite gets its own try plus one repair of a small error
+                bonus = max(0, s.get("attempts", 0) + 2 - self._limit(s))
         if problem is None and s.get("attempts", 0) >= self._limit(s):
             return ok
         if problem is None and self.answer_checks:
@@ -854,8 +860,9 @@ class SQLAgent:
         out = self._fail({**s, "sql": sql}, f"Answer check: {message}")
         out.update(sql=sql, checked=[*(s.get("checked") or []), kind], bonus=s.get("bonus", 0) + bonus,
                    reviewed=bool(s.get("reviewed")) or kind == "review",
-                   # the first query that ran is kept if the re-ask does no better
-                   fallback=s.get("fallback") or {"sql": sql, "result": res})
+                   # the first query that ran is kept if the re-ask does no better; never one that
+                   # a structural check showed to be wrong (multiplied totals, a count of 1 per group)
+                   fallback=s.get("fallback") or (None if kind in _KNOWN_WRONG else {"sql": sql, "result": res}))
         return out
 
     def _grain_problem(self, sql: str, seen: list) -> tuple[str, str] | None:
@@ -1263,6 +1270,9 @@ def _run_settings(llm, agent) -> dict:
 
 def _norm_sql(sql: str) -> str:
     return re.sub(r"\s+", " ", sql).strip().rstrip(";").lower()
+
+
+_KNOWN_WRONG = {"fanout", "count_grouped"}
 
 
 def _settle(state: dict) -> dict:

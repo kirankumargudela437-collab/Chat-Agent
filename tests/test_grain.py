@@ -244,3 +244,44 @@ def test_count_grouped_message_counts_the_distinct_key(tmp_path):
     r = agent.run("How many orders have a repeated amount?")
     msg = r.failures[0][1]
     assert "SELECT COUNT(DISTINCT order_id) FROM (SELECT order_id" in msg and "not COUNT(*)" in msg
+
+
+def test_ambiguous_column_is_qualified_with_the_from_table(tmp_path):
+    from docqa.sqlhints import qualify_ambiguous
+
+    db = _shop(tmp_path)
+    sql = ("WITH b AS (SELECT order_id, SUM(amount) s FROM lines GROUP BY order_id) "
+           "SELECT COUNT(order_id) FROM orders o LEFT JOIN b ON b.order_id = o.order_id")
+    fixed = qualify_ambiguous(db, sql, "ambiguous column name: order_id")
+    assert "COUNT(o.order_id)" in fixed and "b.order_id = o.order_id" in fixed
+    import sqlite3 as _s
+
+    con = _s.connect(tmp_path / "shop.db")
+    assert con.execute(fixed).fetchone() == (3,)
+    assert qualify_ambiguous(db, "SELECT 1 FROM orders", "no such column: x") is None
+
+
+def test_known_wrong_query_is_never_the_fallback(tmp_path):
+    db = _shop(tmp_path)
+    broken = "```sql\nSELECT nope FROM orders\n```"
+    agent = SQLAgent(FakeListChatModel(responses=["plan", FAN, broken, broken]), db=db, value_lookup=False,
+                     sql_patterns=False, answer_checks=False, grain_plan=True, max_attempts=2)
+    r = agent.run("Booked and paid per order")
+    # the fan-out query ran but was flagged; the rewrite never ran: an honest failure, not the bad totals
+    assert not r.ok and r.attempts == 3 and r.rows == []
+
+
+def test_rewrite_after_a_grain_reask_gets_a_repair(tmp_path):
+    db = _shop(tmp_path)
+    ambiguous_ok = TOTALS.replace("SELECT o.order_id, b.s", "SELECT o.order_id AS oid, b.s")
+    broken = "```sql\nSELECT nope FROM orders\n```"
+    agent = SQLAgent(FakeListChatModel(responses=["plan", broken, FAN, broken, ambiguous_ok]), db=db,
+                     value_lookup=False, sql_patterns=False, answer_checks=False, grain_plan=True, max_attempts=3)
+    r = agent.run("Booked and paid per order")
+    assert r.ok and r.attempts == 4 and (3, 10, 0) in r.rows
+
+
+def test_fanout_with_a_child_table_in_from(tmp_path):
+    db = _shop(tmp_path)
+    sql = "SELECT l.order_id, SUM(l.amount), SUM(p.amount) FROM lines l JOIN payments p ON p.order_id = l.order_id GROUP BY l.order_id"
+    assert fanout_joins(db, sql, "sqlite") == [("lines", "payments", "orders")]

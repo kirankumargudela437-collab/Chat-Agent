@@ -334,6 +334,54 @@ def auto_fix_identifiers(db, sql: str, dialect: str = "sqlite") -> str | None:
     return fixed
 
 
+def qualify_ambiguous(db, sql: str, error: str, dialect: str = "sqlite") -> str | None:
+    """``ambiguous column name: order_id``: qualify each bare use of that column with the
+    FROM source of its own SELECT when that source has the column (``COUNT(order_id)`` over
+    ``FROM orders o JOIN ...`` becomes ``COUNT(o.order_id)``). The FROM table is the row the
+    SELECT is about; when it lacks the column nothing is guessed and the error goes back."""
+    m = re.search(r"ambiguous column(?: name)?:?\s*[\"'`]?([\w.]+)", error, re.I)
+    if not m:
+        return None
+    name = m.group(1).split(".")[-1].lower()
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except Exception:
+        return None
+    tables = {t.lower(): {c.lower() for c in cols} for t, cols in _columns_by_table(db).items()}
+    ctes = {}
+    for cte in tree.find_all(exp.CTE):
+        body = cte.this
+        if isinstance(body, exp.Select):
+            ctes[cte.alias_or_name.lower()] = {e.alias_or_name.lower() for e in body.expressions}
+
+    def has(source) -> bool:
+        if isinstance(source, exp.Table):
+            cols = ctes.get(source.name.lower()) or tables.get(source.name.lower(), set())
+            return name in cols
+        if isinstance(source, exp.Subquery) and isinstance(source.this, exp.Select):
+            return name in {e.alias_or_name.lower() for e in source.this.expressions}
+        return False
+
+    changed = False
+    for select in tree.find_all(exp.Select):
+        frm = (select.args.get("from_") or select.args.get("from"))
+        if frm is None or not select.args.get("joins") or not has(frm.this):
+            continue
+        alias = frm.this.alias_or_name
+        own_aliases = {e.alias.lower() for e in select.expressions if isinstance(e, exp.Alias)}
+        for col in select.find_all(exp.Column):
+            if col.table or col.name.lower() != name or col.find_ancestor(exp.Select) is not select:
+                continue
+            if name in own_aliases and col.find_ancestor(exp.Order, exp.Group, exp.Having) is not None:
+                continue  # ORDER BY / GROUP BY an output alias
+            col.set("table", exp.to_identifier(alias))
+            changed = True
+    return tree.sql(dialect=dialect) if changed else None
+
+
 # --------------------------------------------------------------------------- routing evidence
 
 
