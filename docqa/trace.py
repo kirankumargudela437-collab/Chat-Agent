@@ -77,6 +77,7 @@ class CallTracer(BaseCallbackHandler):
         self.write({"type": "run", "time": time.strftime("%Y-%m-%dT%H:%M:%S"), **(settings or {})})
 
     def write(self, record: dict) -> None:
+        record.setdefault("time", time.strftime("%Y-%m-%dT%H:%M:%S"))  # every line, so a run can be audited
         with self._lock, open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
