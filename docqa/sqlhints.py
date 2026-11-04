@@ -317,10 +317,21 @@ def auto_fix_identifiers(db, sql: str, dialect: str = "sqlite") -> str | None:
         table, real = hits[0]
         col.set("this", exp.to_identifier(real, quoted=not re.fullmatch(r"[A-Za-z_]\w*", real)))
         if qual and alias_to_table.get(qual) != table:
+            if col.find_ancestor(exp.Join) is not None:
+                # inside a join condition, moving the column to another alias can turn
+                # "lr.order_id = o.order_id" into "o.order_id = o.order_id": a cross join
+                continue
             alias = next((a for a, t in alias_to_table.items() if t == table and a != table.lower()), table)
             col.set("table", exp.to_identifier(alias_spelling.get(alias, alias)))
         changed = True
-    return tree.sql(dialect=dialect) if changed else None
+    if not changed:
+        return None
+    fixed = tree.sql(dialect=dialect)
+    from .sqlchecks import self_comparisons
+
+    if len(self_comparisons(fixed, dialect)) > len(self_comparisons(sql, dialect)):
+        return None  # never trade a clear "no such column" for an always-true join
+    return fixed
 
 
 # --------------------------------------------------------------------------- routing evidence

@@ -45,8 +45,8 @@ from typing import Any, Optional, TypedDict
 import sqlglot
 from sqlglot import exp
 
-from .sqlchecks import (REVIEW_PROMPT, dry_run, fanout_joins, fanout_shape, join_keys, join_paths, missing_values,
-                        optional_side_filters, parse_review, result_problems, self_comparisons, tables_in)
+from .sqlchecks import (REVIEW_PROMPT, counted_group_keys, dry_run, fanout_joins, fanout_shape, join_keys,
+                        join_paths, missing_values, optional_side_filters, parse_review, result_problems, self_comparisons, tables_in)
 from .trace import set_question, set_step
 from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
 from langchain_core.language_models import BaseChatModel
@@ -800,9 +800,8 @@ class SQLAgent:
                     res = run_query(self.db, fixed, self.max_rows)
                     log.info("Repaired identifiers: %s -> %s", sql, fixed)
                     return self._checked(s, fixed, res)
-                except Exception as e2:
-                    error = _db_error(e2)
-                    sql = fixed
+                except Exception as e2:  # keep the model's query and its clear error, not the fix's
+                    log.info("Identifier repair still fails (%s); keeping the original error", _db_error(e2))
             hint = error_hint(self.db, sql, error, self.dialect)
             if self.error_help is not None:  # a manual page for function / date / syntax errors
                 try:
@@ -870,6 +869,14 @@ class SQLAgent:
                         "LEFT JOIN acts as an inner join. Move the condition into the CTE that builds "
                         f"{table}, or into the ON clause. If dropping those rows is what the question "
                         "asks, return the same query unchanged.")
+        if "count_grouped" not in seen:
+            hits = counted_group_keys(sql, self.dialect)
+            if hits:
+                return ("count_grouped", f"{hits[0]} is counted inside groups of that same column, so every "
+                        "group counts 1 and the query returns one row per group instead of one number. To count "
+                        "the groups that pass a condition, keep the GROUP BY ... HAVING query as a subquery "
+                        "and COUNT its rows outside: SELECT COUNT(*) FROM (SELECT ... GROUP BY ... HAVING ...) t. "
+                        "If one row per group is what the question asks, return the same query unchanged.")
         if seen.count("fanout") < 2 and self.db is not None:  # a 7B often just reshuffles its CTEs once
             hits = fanout_joins(self.db, sql, self.dialect)
             if hits:

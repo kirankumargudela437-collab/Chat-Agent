@@ -516,3 +516,30 @@ def fanout_shape(db, a: str, b: str, parent: str) -> str:
             f"LEFT JOIN {a}_per_{parent} x ON x.{acol} = p.{pcol}\n"
             f"LEFT JOIN {b}_per_{parent} y ON y.{bcol} = p.{pcol}\n"
             f"WHERE <conditions on {parent}>  -- then use COALESCE(x.{a}_total, 0), COALESCE(y.{b}_total, 0)")
+
+
+def counted_group_keys(sql: str, dialect: str) -> list[str]:
+    """``COUNT(DISTINCT x)`` in a SELECT that also groups by ``x``: each group counts exactly 1.
+    The model meant to count the groups (orders with a repeated product), which needs the
+    grouped query as a subquery."""
+    from sqlglot import exp
+
+    tree = _parse(sql, dialect)
+    if tree is None:
+        return []
+    found = []
+    for select in tree.find_all(exp.Select):
+        group = select.args.get("group")
+        if group is None:
+            continue
+        keys = {g.sql(dialect=dialect).lower() for g in group.expressions if isinstance(g, exp.Column)}
+        names = {g.name.lower() for g in group.expressions if isinstance(g, exp.Column)}
+        for cnt in select.find_all(exp.Count):
+            if cnt.find_ancestor(exp.Select) is not select or not isinstance(cnt.this, exp.Distinct):
+                continue
+            cols = [c for c in cnt.this.expressions if isinstance(c, exp.Column)]
+            if len(cols) == 1:
+                c = cols[0]
+                if c.sql(dialect=dialect).lower() in keys or (not c.table and c.name.lower() in names):
+                    found.append(cnt.sql(dialect=dialect))
+    return list(dict.fromkeys(found))

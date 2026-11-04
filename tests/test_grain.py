@@ -187,3 +187,32 @@ def test_fanout_check_fires_again_when_the_model_keeps_the_fanout(tmp_path):
                      sql_patterns=False, answer_checks=False, grain_plan=True, max_attempts=3)
     r = agent.run("Booked and paid per order")
     assert r.attempts == 3 and "still joins" in r.failures[-1][1] and (3, 10, 0) in r.rows
+
+
+def test_auto_fix_never_turns_a_join_into_a_self_comparison(tmp_path):
+    from docqa.sqlhints import auto_fix_identifiers
+
+    db = _shop(tmp_path)
+    con = sqlite3.connect(tmp_path / "shop.db")
+    con.execute("CREATE TABLE returns (return_id INTEGER PRIMARY KEY, line_id INTEGER, returned_on TEXT)")
+    con.commit(); con.close()
+    db = open_database(f"sqlite:///{tmp_path / 'shop.db'}")
+    # returns has no order_id; moving it to o would give "o.order_id = o.order_id", a cross join
+    sql = "SELECT COUNT(*) FROM orders o JOIN returns r ON r.order_id = o.order_id"
+    assert auto_fix_identifiers(db, sql) is None
+    # outside a join condition the wrong alias is still moved
+    moved = auto_fix_identifiers(db, "SELECT r.status FROM orders o JOIN returns r ON r.return_id = o.order_id")
+    assert moved is not None and "o.status" in moved
+
+
+def test_count_distinct_of_the_group_key(tmp_path):
+    from docqa.sqlchecks import counted_group_keys
+
+    bad = ("SELECT COUNT(DISTINCT o.order_id) FROM orders o JOIN lines l ON l.order_id = o.order_id "
+           "GROUP BY o.order_id, l.amount HAVING COUNT(l.line_id) > 1")
+    assert counted_group_keys(bad, "sqlite") == ["COUNT(DISTINCT o.order_id)"]
+    good = ("SELECT COUNT(*) FROM (SELECT l.order_id FROM lines l GROUP BY l.order_id, l.amount "
+            "HAVING COUNT(*) > 1) t")
+    assert counted_group_keys(good, "sqlite") == []
+    per_group = "SELECT o.status, COUNT(DISTINCT o.placed_by) FROM orders o GROUP BY o.status"
+    assert counted_group_keys(per_group, "sqlite") == []
