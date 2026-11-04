@@ -420,6 +420,12 @@ shows which questions are always wrong versus flaky, and writes a CSV with a `re
 column for the manual pass. `DOCQA_TEMPERATURE`, `DOCQA_SEED` and `DOCQA_NUM_PREDICT` control
 sampling and the output cap.
 
+**What does database feedback repair?** `docqa replay-repair --db northstar.sqlite --rows N1/rows.jsonl
+--schema schema.sql --rules business_rules.md --ids diag80.txt --out C1.jsonl` replays saved predictions
+on a read-only database: a query that runs is kept exactly as saved; one the database rejects goes back
+to the model with the real error (plus the identifier and alias hints) for up to `--max-repairs`
+corrections. No expected rows or answer key reach the agent; score the output with your own scorer.
+
 For a fair comparison, freeze question sets: `--save-ids` writes the chosen ids, `--ids` runs
 exactly those, and `--exclude-ids` keeps the regression questions out of an unseen set:
 `docqa eval bird --exclude-ids regression30.txt --limit 60 --seed 1 --save-ids unseen60.txt`.

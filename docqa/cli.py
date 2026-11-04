@@ -321,6 +321,46 @@ def cmd_eval(args) -> int:
     return 0
 
 
+def cmd_replay_repair(args) -> int:
+    """Replay saved predictions against a read-only database; repair only the ones it rejects."""
+    import json as _json
+
+    from .benchmark import read_ids
+    from .providers import make_llm
+    from .sql import SQLAgent, open_database
+
+    s = Settings.from_env()
+    db = open_database(f"sqlite:///{Path(args.db).resolve()}") if "://" not in args.db else open_database(args.db)
+    agent = SQLAgent(make_llm(s), db=db, max_attempts=1 + args.max_repairs, schema_linking=False,
+                     value_lookup=False, sql_patterns=s.sql_patterns and not args.no_patterns,
+                     answer_checks=False, review=False)
+    schema = Path(args.schema).read_text(encoding="utf-8") if args.schema else ""
+    rules = Path(args.rules).read_text(encoding="utf-8") if args.rules else ""
+    keep = set(read_ids(args.ids)) if args.ids else None
+    rows = [_json.loads(x) for x in Path(args.rows).read_text(encoding="utf-8").splitlines() if x.strip()]
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    n = rejected = still = 0
+    with open(out, "w", encoding="utf-8") as fh:
+        for row in rows:
+            qid = str(row.get("id") or row.get("question_id"))
+            if keep is not None and qid not in keep:
+                continue
+            sql = row.get("pred_sql") or row.get("predicted_sql") or row.get("sql") or ""
+            r = agent.repair_from(row["question"], sql, schema, rules, args.max_repairs)
+            n += 1
+            rejected += bool(r["first_error"])
+            still += bool(r["error"])
+            # only what the agent produced: no gold SQL, no expected rows (they stay with the scorer)
+            fh.write(_json.dumps({"id": qid, **r}, ensure_ascii=False) + "\n")
+            fh.flush()
+            mark = "ok" if not r["first_error"] else ("fixed-runs" if not r["error"] else "still-fails")
+            print(f"[{n}] {qid} {mark} repairs={r['repairs']} {r['seconds']:.1f}s", flush=True)
+    print(f"\n{n} replayed: {rejected} rejected by the database on the first attempt, "
+          f"{rejected - still} run after repair, {still} still fail. Score {out} with your own scorer.")
+    return 0
+
+
 def cmd_failures(args) -> int:
     from .failures import main
 
@@ -439,6 +479,18 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--no-patterns", action="store_true", help="don't show worked examples of SQL techniques")
     ev.add_argument("--sql-candidates", type=int, help="write N queries and keep the majority result (default DOCQA_SQL_CANDIDATES=1)")
     ev.set_defaults(func=cmd_eval)
+
+    rr = sub.add_parser("replay-repair", help="rerun saved SQL on a read-only database and repair only "
+                        "what it rejects, using the real error (measures what database feedback fixes)")
+    rr.add_argument("--db", required=True, help="SQLite file (opened read-only) or a database URL")
+    rr.add_argument("--rows", required=True, help="saved predictions, JSONL with id, question, pred_sql")
+    rr.add_argument("--schema", help="the schema text the original run gave the model")
+    rr.add_argument("--rules", help="the business rules / context the original run gave the model")
+    rr.add_argument("--ids", help="only these question ids (e.g. the 80 diagnostic ones)")
+    rr.add_argument("--max-repairs", type=int, default=2)
+    rr.add_argument("--no-patterns", action="store_true", help="match a run that had the SQL patterns off")
+    rr.add_argument("--out", required=True)
+    rr.set_defaults(func=cmd_replay_repair)
 
     fr = sub.add_parser("failures", help="label SQL failures across runs (from results + DOCQA_TRACE_FILE traces)")
     fr.add_argument("--run", action="append", required=True,

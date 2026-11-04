@@ -914,6 +914,50 @@ class SQLAgent:
         result.alternatives = [st.get("sql", "") for st in states if st.get("executed") and not st.get("error")]
         return result
 
+    def repair_from(self, question: str, sql: str, schema: str = "", context: str = "",
+                    max_repairs: int = 2) -> dict:
+        """Run a saved query and, if the database rejects it, send the real error back for up
+        to ``max_repairs`` corrections. Nothing else is fed back: no expected rows, no answer key.
+
+        The first attempt is exactly ``sql``, so a replay measures what database feedback alone
+        repairs. ``schema`` and ``context`` should be what the original run gave the model; the
+        SQL techniques are appended to the context the same way ``run`` does.
+        """
+        start = time.monotonic()
+        set_question(question)
+        set_step("replay", attempt=1)
+        st: dict = {
+            "question": question,
+            "schema": f"-- Provided by the user:\n{schema.strip()}" if schema.strip() else self.schema_text("", question),
+            "context": self._with_patterns(question, context),
+            "examples": [], "mapping": "", "sql": sql, "attempts": 1, "failures": [],
+        }
+        if _ASKS_FOR_ALL.search(question):
+            st["hint"] = ALL_INFO_HINT
+        st.update(self._node_check(st))
+        first_error = st.get("error")
+        auto_fixed = bool(not first_error and _norm_sql(st["sql"]) != _norm_sql(sql))
+        while st.get("error") and st["attempts"] < 1 + max_repairs:
+            st.update(self._node_generate(st))
+            st.update(self._node_check(st))
+        st = _settle(st)
+        out = {
+            "question": question,
+            "original_sql": sql,
+            "pred_sql": st.get("sql", ""),
+            "executed": bool(st.get("executed")) and not st.get("error"),
+            "error": st.get("error") or "",
+            "first_error": first_error or "",
+            "attempts": st["attempts"],
+            "repairs": st["attempts"] - 1,
+            "auto_fixed": auto_fixed,  # identifiers repaired without a model call
+            "errors": [e for _, e in st.get("failures", [])],
+            "seconds": round(time.monotonic() - start, 2),
+        }
+        if self.tracer is not None:
+            self.tracer.event("replay", **{k: v for k, v in out.items() if k != "question"})
+        return out
+
     def _with_patterns(self, question: str, context: str) -> str:
         """Append the SQL techniques that fit the question, with worked examples."""
         if self._patterns is None:

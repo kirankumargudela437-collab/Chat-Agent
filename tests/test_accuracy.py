@@ -768,3 +768,30 @@ def test_failure_report_labels_and_patterns_across_runs(tmp_path):
     assert "Always right 0, flaky 1, always wrong 1" in text
     assert "| 5 |" not in text  # held-out question left out
     assert (tmp_path / "rep.csv").read_text().count("\n") == 5
+
+
+def test_replay_keeps_the_first_attempt_and_repairs_only_database_errors(tmp_path):
+    db_path = tmp_path / "ns.db"
+    con = sqlite3.connect(db_path)
+    con.executescript("CREATE TABLE orders (order_id INTEGER, status TEXT); INSERT INTO orders VALUES (1,'Completed'),(2,'Open');")
+    con.commit(); con.close()
+    calls = []
+
+    class Rec(FakeListChatModel):
+        def _call(self, messages, *a, **k):
+            calls.append(messages[-1].content if isinstance(messages, list) else str(messages))
+            return super()._call(messages, *a, **k)
+
+    llm = Rec(responses=["```sql\nSELECT COUNT(*) FROM orders WHERE status = 'Completed'\n```"])
+    agent = SQLAgent(llm, db=open_database(f"sqlite:///{db_path}"), schema_linking=False, value_lookup=False,
+                     sql_patterns=False, answer_checks=False, max_attempts=3)
+    # runs as saved: no model call, unchanged
+    ok = agent.repair_from("How many completed orders?", "SELECT COUNT(*) FROM orders WHERE status = 'Completed'",
+                           "CREATE TABLE orders (order_id INTEGER, status TEXT);")
+    assert ok["repairs"] == 0 and ok["executed"] and not ok["first_error"] and not calls
+    # rejected (no such column) -> one repair with the real error in the prompt
+    bad = agent.repair_from("How many completed orders?", "SELECT COUNT(*) FROM orders WHERE order_status = 'Completed'",
+                            "CREATE TABLE orders (order_id INTEGER, status TEXT);", "Completed means status = 'Completed'.")
+    assert "no such column" in bad["first_error"] and bad["executed"] and bad["repairs"] == 1
+    assert "no such column" in calls[0] and "order_status" in calls[0]
+    assert "status = 'Completed'" in bad["pred_sql"]
