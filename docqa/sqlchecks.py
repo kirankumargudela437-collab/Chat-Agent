@@ -445,11 +445,19 @@ def optional_side_filters(sql: str, dialect: str, db=None) -> list[tuple[str, st
 
 
 def fanout_joins(db, sql: str, dialect: str) -> list[tuple[str, str, str]]:
-    """``(table_a, table_b, parent)`` where a query aggregates (SUM/AVG/COUNT) over a join of two
+    """``(table_a, table_b, parent)`` for each fan-out (see ``fanout_sites``)."""
+    return list(dict.fromkeys(site[:3] for site in fanout_sites(db, sql, dialect)))
+
+
+def fanout_sites(db, sql: str, dialect: str) -> list[tuple[str, str, str, str, tuple[str, ...]]]:
+    """``(table_a, table_b, parent, cte, others)`` where a query aggregates (SUM/AVG/COUNT) over a join of two
     tables that each have several rows per the same parent: each row of one is repeated for
     every matching row of the other, so totals are multiplied. The join may sit in the SELECT
     that aggregates or in a CTE that a later SELECT aggregates. Totalling each table per
-    parent key in its own CTE first avoids it. ``fanout_shape`` writes that shape out."""
+    parent key in its own CTE first avoids it. ``fanout_shape`` writes that shape out.
+    ``cte`` names the CTE that holds the join ("" when it is the main query); ``others`` are
+    the other many-row tables of that SELECT that hang off ``table_a`` or ``table_b`` (returns of
+    a line), which have to be totalled per parent through their own parent row."""
     from sqlglot import exp
 
     tree = _parse(sql, dialect)
@@ -488,7 +496,10 @@ def fanout_joins(db, sql: str, dialect: str) -> list[tuple[str, str, str]]:
                     # siblings joined through that parent's key (not two tables that merely share a dimension)
                     if child == a and (b, parent) in many and many[(a, parent)][0].lower() in on_cols \
                             and many[(b, parent)][0].lower() in on_cols:
-                        found.append((a, b, parent))
+                        cte = select.parent.alias_or_name if in_cte else ""
+                        others = tuple(t for t in tables if t not in (a, b, parent)
+                                       and ((t, a) in many or (t, b) in many))
+                        found.append((a, b, parent, cte, others))
     return list(dict.fromkeys(found))
 
 

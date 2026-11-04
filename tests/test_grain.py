@@ -216,3 +216,31 @@ def test_count_distinct_of_the_group_key(tmp_path):
     assert counted_group_keys(good, "sqlite") == []
     per_group = "SELECT o.status, COUNT(DISTINCT o.placed_by) FROM orders o GROUP BY o.status"
     assert counted_group_keys(per_group, "sqlite") == []
+
+
+def test_fanout_site_names_the_cte_and_grandchild_tables(tmp_path):
+    from docqa.sqlchecks import fanout_sites
+
+    db = _shop(tmp_path)
+    con = sqlite3.connect(tmp_path / "shop.db")
+    con.execute("CREATE TABLE refunds (refund_id INTEGER PRIMARY KEY, line_id INTEGER REFERENCES lines(line_id), "
+                "amount INTEGER)")
+    con.commit(); con.close()
+    db = open_database(f"sqlite:///{tmp_path / 'shop.db'}")
+    sql = ("WITH lt AS (SELECT order_id, SUM(amount) s FROM lines GROUP BY order_id), "
+           "j AS (SELECT o.order_id, l.amount la, p.amount pa, r.amount ra FROM orders o "
+           "JOIN lines l ON l.order_id = o.order_id JOIN payments p ON p.order_id = o.order_id "
+           "LEFT JOIN refunds r ON r.line_id = l.line_id) "
+           "SELECT j.order_id, SUM(la), SUM(pa), SUM(ra) FROM j GROUP BY j.order_id")
+    assert fanout_sites(db, sql, "sqlite") == [("lines", "payments", "orders", "j", ("refunds",))]
+
+
+def test_count_grouped_message_counts_the_distinct_key(tmp_path):
+    db = _shop(tmp_path)
+    bad = ("```sql\nSELECT COUNT(DISTINCT l.order_id) FROM lines l GROUP BY l.order_id, l.amount "
+           "HAVING COUNT(*) >= 1\n```")
+    agent = SQLAgent(FakeListChatModel(responses=["plan", bad, bad]), db=db, value_lookup=False,
+                     sql_patterns=False, answer_checks=False, grain_plan=True, max_attempts=3)
+    r = agent.run("How many orders have a repeated amount?")
+    msg = r.failures[0][1]
+    assert "SELECT COUNT(DISTINCT order_id) FROM (SELECT order_id" in msg and "not COUNT(*)" in msg

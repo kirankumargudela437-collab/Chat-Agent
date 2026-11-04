@@ -45,7 +45,7 @@ from typing import Any, Optional, TypedDict
 import sqlglot
 from sqlglot import exp
 
-from .sqlchecks import (REVIEW_PROMPT, counted_group_keys, dry_run, fanout_joins, fanout_shape, join_keys,
+from .sqlchecks import (REVIEW_PROMPT, counted_group_keys, dry_run, fanout_shape, fanout_sites, join_keys,
                         join_paths, missing_values, optional_side_filters, parse_review, result_problems, self_comparisons, tables_in)
 from .trace import set_question, set_step
 from .sqlhints import ValueIndex, auto_fix_identifiers, error_hint, format_value_hints, schema_fit
@@ -872,21 +872,32 @@ class SQLAgent:
         if "count_grouped" not in seen:
             hits = counted_group_keys(sql, self.dialect)
             if hits:
-                return ("count_grouped", f"{hits[0]} is counted inside groups of that same column, so every "
-                        "group counts 1 and the query returns one row per group instead of one number. To count "
-                        "the groups that pass a condition, keep the GROUP BY ... HAVING query as a subquery "
-                        "and COUNT its rows outside: SELECT COUNT(*) FROM (SELECT ... GROUP BY ... HAVING ...) t. "
+                m = re.search(r"DISTINCT\s+(?:\w+\.)?([\w\"]+)", hits[0], re.I)
+                key = m.group(1) if m else "the key"
+                return ("count_grouped", f"{hits[0]} is counted inside groups that include that same column, so "
+                        "every group counts 1 and the query returns one row per group instead of one number. "
+                        f"To count the distinct {key} values whose groups pass the condition, keep the "
+                        "GROUP BY ... HAVING query as a subquery that returns that column and count it outside: "
+                        f"SELECT COUNT(DISTINCT {key}) FROM (SELECT {key}, ... GROUP BY {key}, ... HAVING ...) t. "
+                        f"Use COUNT(DISTINCT {key}), not COUNT(*): one {key} can have several groups. "
                         "If one row per group is what the question asks, return the same query unchanged.")
         if seen.count("fanout") < 2 and self.db is not None:  # a 7B often just reshuffles its CTEs once
-            hits = fanout_joins(self.db, sql, self.dialect)
-            if hits:
-                a, b, parent = hits[0]
+            sites = fanout_sites(self.db, sql, self.dialect)
+            if sites:
+                a, b, parent, cte, others = sites[0]
                 again = "still " if "fanout" in seen else ""
-                return ("fanout", f"This query {again}joins {a} and {b} in the same SELECT, and both have several "
-                        f"rows per {parent}, so each {a} row is repeated once per matching {b} row and every "
-                        f"SUM or COUNT over them is multiplied. Never join {a} and {b} to each other. Total each "
-                        f"one per {parent} in its own CTE that reads only that table, then join both totals to "
-                        f"{parent}, in this shape:\n" + fanout_shape(self.db, a, b, parent))
+                where = f"The CTE {cte} {again}joins" if cte else f"This query {again}joins"
+                text = (f"{where} {a} and {b} in the same SELECT, and both have several rows per {parent}, so each "
+                        f"{a} row is repeated once per matching {b} row and every SUM or COUNT over them is "
+                        f"multiplied. Never join {a} and {b} to each other. Total each one per {parent} in its own "
+                        f"CTE that reads only that table, then join both totals to {parent}")
+                if cte:
+                    text += f"; delete {cte} and do not reuse it"
+                text += ". "
+                if others:
+                    text += (f"{', '.join(others)} also has several rows per row of {a} or {b}: total it per "
+                             f"{parent} in its own CTE too, joining only to its own parent table inside that CTE. ")
+                return ("fanout", text + "Shape:\n" + fanout_shape(self.db, a, b, parent))
         return None
 
     def _fail(self, s: SQLState, error: str) -> dict:
