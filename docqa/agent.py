@@ -11,10 +11,11 @@ For each question:
 3. **Run** each planned specialist once, searching only its own kind of chunk
    (``category`` metadata), with a fallback to all chunks when that finds nothing.
 4. **Combine**: with more than one specialist, one more call merges their partial
-   answers, keeping citations and SQL.
+   answers, keeping citations. SQL never goes through that call: the query the SQL
+   specialist wrote is shown unchanged after any cited explanation.
 
 The plan is fixed before anything runs and every specialist runs at most once,
-so a question costs at most five model calls plus the SQL retries. A supervisor
+so a question costs at most six model calls plus the SQL retries. A supervisor
 that re-decides after every step can keep picking the same worker forever, and
 it is slower on small local models. The SQL specialist already reads business
 rules from the documents, so "SQL + DOC" is only needed when the user also wants
@@ -24,6 +25,8 @@ a written explanation from the documents.
 from __future__ import annotations
 
 import re
+import sqlite3
+from dataclasses import replace
 from typing import Iterator
 
 from langchain_core.documents import Document
@@ -42,12 +45,18 @@ from .chain import (
     citation_label,
     clean_condensed,
     history_as_text,
+    is_not_found,
 )
 from .keyword import KeywordIndex, doc_key, reciprocal_rank_fusion
 from .sql import SQLAgent, SQLResult, format_sql_answer
 
 ROUTES = ("SQL", "CODE", "DOC")
 _MENTIONS_TABLES = re.compile(r"create\s+table|\btables?\b|\bcolumns?\b", re.IGNORECASE)
+_ASKS_FOR_QUERY = re.compile(r"\b(?:sql|quer(?:y|ies))\b", re.IGNORECASE)
+_USES_RULES = re.compile(r"\b(?:cite|citations?|polic(?:y|ies)|rules?|terms|handbook|sources?)\b", re.IGNORECASE)
+_SQL_TEXT = re.compile(r"\bselect\b.*\bfrom\b", re.IGNORECASE | re.DOTALL)
+_FENCE = re.compile(r"```.*?(?:```|$)", re.DOTALL)
+_CITED_SENTENCE = re.compile(r"([^\[\]\n]+?)\s*\[(\d+)\]")
 
 _ROUTE_HELP = {
     "SQL": "SQL: write or run a database query: metrics, KPIs, reports, counts, tables, columns, joins, 'write a query'.",
@@ -75,8 +84,58 @@ PLAN_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 
+RULE_CHECK_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You check whether written business rules are complete enough to write a SQL query. "
+            "You never write SQL.\n"
+            "A request can depend on a business term, threshold, rate, formula or status. If the "
+            "passages or the schema define every one the request needs, reply exactly: READY\n"
+            "If any is missing, reply: ASK: followed by one question that asks the user for it.\n\n"
+            "Examples:\n"
+            "Passages: Members with 10 or more visits earn a free visit.\n"
+            "Request: Write SQL for members earning a free visit.\n"
+            "Reply: READY\n\n"
+            "Passages: The librarian reviews late returns.\n"
+            "Request: Write SQL for the late-return charge per member.\n"
+            "Reply: ASK: How is the late-return charge calculated, and what counts as late?",
+        ),
+        ("human", "Schema:\n{schema}\n\nPassages:\n{context}\n\nRequest: {question}\nReply:"),
+    ]
+)
+
+RULE_NOTES_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You copy rule sentences from numbered passages. You never write SQL.\n"
+            "For the request below, copy each sentence from the passages that defines a rule, threshold, "
+            "amount, code or date the request depends on. Put one sentence per line and end each line "
+            "with its passage number in brackets.\n\n"
+            "Example\n"
+            "Passages:\n"
+            "[1] Members with 10 or more visits earn a free visit.\n"
+            "[2] Kind L means a long visit. The gym opens at six.\n"
+            "Request: Write SQL listing members earning a free visit from long visits.\n"
+            "Reply:\n"
+            "Members with 10 or more visits earn a free visit. [1]\n"
+            "Kind L means a long visit. [2]\n\n"
+            "Passages:\n{context}",
+        ),
+        ("human", "Request: {question}\nReply:"),
+    ]
+)
+
+
 def _numbered(docs: list[Document], start: int) -> str:
     return "\n\n".join(f"[{i}] (source: {citation_label(d)})\n{d.page_content}" for i, d in enumerate(docs, start))
+
+
+def _supported(sentence: str, passage: str, share: float = 0.7) -> bool:
+    words = re.findall(r"\w+", sentence.lower())
+    found = set(re.findall(r"\w+", passage.lower()))
+    return bool(words) and sum(w in found for w in words) >= share * len(words)
 
 
 def parse_plan(text: str, available: list[str], limit: int = 3) -> list[str]:
@@ -120,6 +179,8 @@ class Agent:
         self._doc = ANSWER_PROMPT | llm | StrOutputParser()
         self._code = CODE_PROMPT | llm | StrOutputParser()
         self._combine = COMBINE_PROMPT | llm | StrOutputParser()
+        self._rule_check = RULE_CHECK_PROMPT | llm | StrOutputParser()
+        self._rule_notes = RULE_NOTES_PROMPT | llm | StrOutputParser()
         self._categories: set[str] | None = None
         self._keyword: dict[str | None, KeywordIndex] = {}
 
@@ -173,7 +234,13 @@ class Agent:
         if len(available) <= 1:
             return available or ["DOC"]
         routes = "\n".join(_ROUTE_HELP[r] for r in available)
-        return parse_plan(self._plan.invoke({"routes": routes, "question": question}), available) or ["ALL"]
+        planned = parse_plan(self._plan.invoke({"routes": routes, "question": question}), available) or ["ALL"]
+        if {"SQL", "DOC"} <= set(planned) and not self._connected() and not _ASKS_FOR_QUERY.search(question):
+            planned.remove("SQL")  # with no database a query can't answer this; only the documents can
+        return planned
+
+    def _connected(self) -> bool:
+        return self.sql_agent.db is not None or self.sql_agent.catalog is not None
 
     def _keyword_index(self, category: str | None) -> KeywordIndex:
         if category not in self._keyword:
@@ -257,6 +324,49 @@ class Agent:
         found = self._find(query, "doc", 1)
         return f"From the documents ({citation_label(found[0])}):\n{found[0].page_content[:max_chars]}" if found else ""
 
+    def _missing_rule(self, question: str, passages: str) -> str:
+        """The question to ask when the documents don't define what a query needs, else empty.
+
+        A small model can ask for a rule that is right there, so its question is put to the
+        documents first; it only reaches the user if they can't answer it.
+        """
+        reply = self._rule_check.invoke({"schema": self.schema.strip(), "context": passages, "question": question})
+        m = re.match(r"\s*ASK\s*:\s*(.+)", reply, re.IGNORECASE)
+        if not m:
+            return ""
+        ask = m.group(1).strip().splitlines()[0].strip()
+        return ask if is_not_found(self._doc.invoke({"context": passages, "question": ask})) else ""
+
+    def _notes_for(self, question: str, passages: str, docs: list[Document]) -> str:
+        """Rule sentences with citations, kept apart from the query. A sentence stays only if
+        the passage it cites really contains its words, so a citation can't be made up."""
+        reply = _FENCE.sub("", self._rule_notes.invoke({"context": passages, "question": question}))
+        kept: list[str] = []
+        for sentence, number in _CITED_SENTENCE.findall(reply):
+            i = int(number)
+            line = f"{sentence.strip()} [{i}]"
+            if 1 <= i <= len(docs) and line not in kept and _supported(sentence, docs[i - 1].page_content):
+                kept.append(line)
+        return "\n".join(kept)
+
+    def _check_offline(self, result: SQLResult) -> SQLResult:
+        """Without a database, a SQLite query can still be compiled against the supplied schema."""
+        if self._connected() or not result.ok or result.dialect != "sqlite" or not self.schema.strip():
+            return result
+        db = sqlite3.connect(":memory:")
+        try:
+            db.executescript(self.schema)
+        except sqlite3.Error:  # a table list rather than DDL: nothing to check against
+            db.close()
+            return result
+        try:
+            db.execute(f"EXPLAIN {result.sql}")
+        except sqlite3.Error as e:
+            return replace(result, error=str(e))
+        finally:
+            db.close()
+        return result
+
     def run_sql(self, sql: str) -> SQLResult:
         """Run the user's own SQL (``/run SELECT ...``) through the same read-only checks."""
         from .sql import check_read_only, run_query
@@ -315,8 +425,12 @@ class Agent:
         sql_result: SQLResult | None = None
         parts: list[str] = []
 
+        with_rules = "SQL" in routes and "DOC" in routes
+        if with_rules:  # the SQL specialist reads the documents and cites them itself
+            routes = [r for r in routes if r != "DOC"]
+
         if len(routes) == 1:
-            gen = self._run_route(routes[0], standalone, docs, stream=True)
+            gen = self._run_route(routes[0], standalone, docs, stream=True, with_rules=with_rules)
             chunks = []
             for item in gen:
                 if isinstance(item, SQLResult):
@@ -326,31 +440,37 @@ class Agent:
                     yield item
             text = "".join(chunks).strip()
         else:
+            sql_text = ""
             for r in routes:
                 start = len(docs) + 1
                 out = []
-                for item in self._run_route(r, standalone, docs, stream=False):
+                for item in self._run_route(r, standalone, docs, stream=False, with_rules=with_rules):
                     if isinstance(item, SQLResult):
                         sql_result = item
                     else:
                         out.append(item)
                 piece = "".join(out).strip()
-                if piece and not piece.startswith(NOT_FOUND):
+                if r == "SQL":
+                    sql_text = piece  # shown as written, so combining can't rewrite the query
+                elif piece and not piece.startswith(NOT_FOUND):
                     parts.append(f"## {r} specialist (passages [{start}]...)\n{piece}")
-            if not parts:
-                text = NOT_FOUND
-                yield text
-            else:
-                chunks = []
+            chunks = []
+            if parts:
                 for tok in self._combine.stream({"parts": "\n\n".join(parts), "question": standalone}):
                     chunks.append(tok)
                     yield tok
-                text = "".join(chunks).strip()
+            if sql_text:
+                chunks.append(f"\n\n{sql_text}" if chunks else sql_text)
+                yield chunks[-1]
+            text = "".join(chunks).strip()
+            if not text:
+                text = NOT_FOUND
+                yield text
 
         self.history += [HumanMessage(question), AIMessage(text)]
         yield Answer(text, question, standalone, docs, tuple(routes), sql_result)
 
-    def _run_route(self, route: str, question: str, docs: list[Document], stream: bool):
+    def _run_route(self, route: str, question: str, docs: list[Document], stream: bool, with_rules: bool = False):
         """Run one specialist. Appends its passages to ``docs`` (shared citation numbering)."""
         start = len(docs) + 1
         if route == "SQL":
@@ -375,15 +495,32 @@ class Agent:
                 for d in context
                 if d.metadata.get("category") == "example" and d.metadata.get("question")
             ]
+            rules = "\n\n".join(
+                f"[{i}] (source: {citation_label(d)})\n{d.page_content}"
+                for i, d in enumerate(context, start)
+                if d.metadata.get("category") == "doc"
+            ) if with_rules or _USES_RULES.search(question) else ""
+            if rules:
+                missing = self._missing_rule(question, rules)
+                if missing:
+                    yield missing
+                    return
             result = self.sql_agent.run(question, _numbered(context, start) if context else "", self.schema, examples,
                                         context_fn=self._database_docs if scoped else None)
+            result = self._check_offline(result)
             yield result
+            if rules and result.sql:
+                notes = self._notes_for(question, rules, docs)
+                if notes:
+                    yield notes + "\n\n"
             summary_tokens = []
             if result.ok and result.executed:
                 for tok in (self.sql_agent.stream_summary(result) if stream else [self.sql_agent.summarize(result)]):
                     summary_tokens.append(tok)
                     yield tok
-            rest = format_sql_answer(result)
+            # a mapping that is itself a query would show the reader a second, different query
+            shown = replace(result, mapping="") if _SQL_TEXT.search(result.mapping or "") else result
+            rest = format_sql_answer(shown)
             yield ("\n\n" + rest) if summary_tokens else rest
             return
 

@@ -35,6 +35,8 @@ from __future__ import annotations
 import importlib.util
 import logging
 import re
+import xml.etree.ElementTree as ElementTree
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -167,7 +169,60 @@ def _load_pdf(path: Path, rel: str) -> list[Document]:
     return docs
 
 
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _docx_block_text(block) -> str:
+    if block.tag == f"{_W}tbl":
+        return "\n".join(
+            " | ".join("".join(t.text or "" for t in cell.iter(f"{_W}t")) for cell in row.findall(f"{_W}tc"))
+            for row in block.findall(f"{_W}tr")
+        )
+    return "".join(t.text or "" for t in block.iter(f"{_W}t"))
+
+
+def _docx_heading_level(paragraph) -> int | None:
+    """Heading depth from the paragraph's style (Heading1, Heading 2...), else None."""
+    style = paragraph.find(f"{_W}pPr/{_W}pStyle")
+    m = re.fullmatch(r"heading\s*(\d+)", (style.get(f"{_W}val") or "") if style is not None else "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _docx_sections(path: Path, rel: str) -> list[Document]:
+    """One Document per Word heading, with the heading trail in ``section`` as for Markdown.
+
+    Empty when the file uses no heading styles, or isn't readable this way.
+    """
+    try:
+        with zipfile.ZipFile(path) as z:
+            body = ElementTree.fromstring(z.read("word/document.xml")).find(f"{_W}body")
+    except (KeyError, zipfile.BadZipFile, ElementTree.ParseError):
+        return []
+    trail: dict[int, str] = {}
+    sections: list[tuple[str, list[str]]] = [("", [])]
+    for block in body if body is not None else []:
+        text = _docx_block_text(block).strip()
+        if not text:
+            continue
+        level = _docx_heading_level(block) if block.tag == f"{_W}p" else None
+        if level is not None:
+            trail = {k: v for k, v in trail.items() if k < level}
+            trail[level] = text
+            sections.append((" > ".join(trail[k] for k in sorted(trail)), []))
+        sections[-1][1].append(text)
+    if len(sections) == 1:
+        return []
+    return [
+        Document(page_content="\n\n".join(lines), metadata={"source": rel, **({"section": name} if name else {})})
+        for name, lines in sections if lines
+    ]
+
+
 def _load_docx(path: Path, rel: str) -> list[Document]:
+    sections = _docx_sections(path, rel)
+    if sections:
+        return sections
+
     import docx2txt
 
     text = (docx2txt.process(str(path)) or "").strip()
