@@ -209,12 +209,26 @@ def cmd_eval(args) -> int:
     import json
 
     from . import open_catalog
-    from .benchmark import evaluate, locate, pick, read_results, route_only, summarize, write_result
+    from .benchmark import TRAIN_FILES, evaluate, locate, pick, read_results, route_only, summarize, write_result
 
     s = _settings(args)
     split = locate(args.name, Path(args.data or f"./benchmarks/{args.name}"), args.questions)
     s.database_dir = split.db_root
-    examples = pick(split.load(), args.limit, args.seed, args.only_db)
+    from .benchmark import read_ids
+
+    every = split.load()
+    if args.ids:  # a frozen question set: exactly these, in this order
+        wanted = read_ids(args.ids)
+        by_id = {e.id: e for e in every}
+        examples = [by_id[i] for i in wanted if i in by_id]
+    else:
+        if args.exclude_ids:  # e.g. keep the regression questions out of an unseen set
+            skip = set(read_ids(args.exclude_ids))
+            every = [e for e in every if e.id not in skip]
+        examples = pick(every, args.limit, args.seed, args.only_db)
+    if args.save_ids:
+        Path(args.save_ids).write_text("\n".join(e.id for e in examples) + "\n", encoding="utf-8")
+        print(f"Saved {len(examples)} question ids to {args.save_ids}")
     if not examples:
         raise ValueError("No questions selected.")
     routing = not args.oracle_db
@@ -233,7 +247,7 @@ def cmd_eval(args) -> int:
         out = s.data_dir / "eval" / f"{args.name}-{split.questions_file.stem}-{mode}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
         done = {}
     if args.route_only:
-        outcomes = route_only(catalog, examples, k)
+        outcomes = route_only(catalog, examples, k, fit=not args.no_fit)
     else:
         from .providers import make_llm
         from .sql import SQLAgent
@@ -251,8 +265,39 @@ def cmd_eval(args) -> int:
             schema_chars=s.sql_schema_chars,
             db_router=args.router or s.sql_db_router,
             db_candidates=k,
+            value_lookup=s.sql_value_lookup and not args.no_values,
+            sql_patterns=s.sql_patterns and not args.no_patterns,
+            patterns_dir=str(s.sql_patterns_dir) if s.sql_patterns_dir else None,
+            sql_candidates=args.sql_candidates or s.sql_candidates,
+            route_margin=s.sql_route_margin if args.route_margin is None else args.route_margin,
+            route_choices=args.route_choices or s.sql_route_choices,
+            answer_checks=s.sql_answer_checks and not args.no_checks,
+            review=s.sql_review or args.review,
+            independent_plans=s.sql_independent_plans or args.independent,
+            answer_shape=s.sql_answer_shape and not args.no_shape,
+            grain_plan=s.sql_grain_plan or args.grain,
         )
-        outcomes = evaluate(agent, split, examples, args.oracle_db, args.timeout, done)
+        bank = None
+        if args.shots:
+            from .benchmark import ExampleBank
+
+            bank = ExampleBank.from_benchmark(args.name, Path(args.train or split.questions_file.parent))
+            if bank is None:
+                print(f"No training questions found for --shots (looked for {', '.join(TRAIN_FILES[args.name])}); running zero-shot.")
+            else:
+                print(f"Few-shot: {args.shots} similar solved questions per question from {len(bank)} training examples")
+        docs = None
+        if args.docs:
+            from .benchmark import DocsContext
+
+            docs = DocsContext(s, Path(args.docs), top_k=s.top_k, patterns=agent._patterns, slim=not args.docs_full)
+            docs.reference_folders = [f for f in docs.docs_by_folder if f not in catalog.paths]
+            if docs.slim:
+                agent.error_help = docs.help_for_error
+            print(f"Documents: {args.docs}: {docs.sync.summary().splitlines()[0]}; "
+                  f"{len(docs.docs_by_folder) - len(docs.reference_folders)} database folders, "
+                  f"reference folders: {', '.join(docs.reference_folders) or 'none'}")
+        outcomes = evaluate(agent, split, examples, args.oracle_db, args.timeout, done, bank, args.shots, docs)
     out.parent.mkdir(parents=True, exist_ok=True)
     results = []
     with open(out, "a" if args.resume else "w", encoding="utf-8") as fh:
@@ -269,11 +314,110 @@ def cmd_eval(args) -> int:
     summary = out.with_suffix(".summary.txt")
     summary.write_text(
         f"{args.name} {split.questions_file.name} {mode} ({len(results)} questions)\n"
-        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'limit': args.limit, 'seed': args.seed})}\n"
+        f"settings: {json.dumps({'llm': f'{s.llm_provider}:{s.llm_model}', 'router': args.router or s.sql_db_router, 'candidates': k, 'linking': s.sql_schema_linking and not args.no_linking, 'embeddings': not args.no_embeddings, 'values': s.sql_value_lookup and not args.no_values, 'patterns': s.sql_patterns and not args.no_patterns, 'docs': args.docs, 'docs_full': args.docs_full, 'checks': s.sql_answer_checks and not args.no_checks, 'review': s.sql_review or args.review, 'independent': s.sql_independent_plans or args.independent, 'shape': s.sql_answer_shape and not args.no_shape, 'grain': s.sql_grain_plan or args.grain, 'shots': args.shots, 'sql_candidates': args.sql_candidates or s.sql_candidates, 'route_margin': s.sql_route_margin if args.route_margin is None else args.route_margin, 'route_choices': args.route_choices or s.sql_route_choices, 'limit': args.limit, 'seed': args.seed})}\n"
         + text + "\n",
         encoding="utf-8",
     )
     print(f"\nPer-question results: {out}\nSummary: {summary}")
+    return 0
+
+
+def cmd_replay_repair(args) -> int:
+    """Replay saved predictions against a read-only database; repair only the ones it rejects."""
+    import json as _json
+
+    from .benchmark import read_ids
+    from .providers import make_llm
+    from .sql import SQLAgent, open_database
+
+    s = Settings.from_env()
+    db = open_database(f"sqlite:///{Path(args.db).resolve()}") if "://" not in args.db else open_database(args.db)
+    agent = SQLAgent(make_llm(s), db=db, max_attempts=1 + args.max_repairs, schema_linking=False,
+                     value_lookup=False, sql_patterns=s.sql_patterns and not args.no_patterns,
+                     answer_checks=False, review=False)
+    schema = Path(args.schema).read_text(encoding="utf-8") if args.schema else ""
+    rules = Path(args.rules).read_text(encoding="utf-8") if args.rules else ""
+    keep = set(read_ids(args.ids)) if args.ids else None
+    rows = [_json.loads(x) for x in Path(args.rows).read_text(encoding="utf-8").splitlines() if x.strip()]
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    n = rejected = still = 0
+    with open(out, "w", encoding="utf-8") as fh:
+        for row in rows:
+            qid = str(row.get("id") or row.get("question_id"))
+            if keep is not None and qid not in keep:
+                continue
+            sql = row.get("pred_sql") or row.get("predicted_sql") or row.get("sql") or ""
+            r = agent.repair_from(row["question"], sql, schema, rules, args.max_repairs)
+            n += 1
+            rejected += bool(r["first_error"])
+            still += bool(r["error"])
+            # only what the agent produced: no gold SQL, no expected rows (they stay with the scorer)
+            fh.write(_json.dumps({"id": qid, **r}, ensure_ascii=False) + "\n")
+            fh.flush()
+            mark = "ok" if not r["first_error"] else ("fixed-runs" if not r["error"] else "still-fails")
+            print(f"[{n}] {qid} {mark} repairs={r['repairs']} {r['seconds']:.1f}s", flush=True)
+    print(f"\n{n} replayed: {rejected} rejected by the database on the first attempt, "
+          f"{rejected - still} run after repair, {still} still fail. Score {out} with your own scorer.")
+    return 0
+
+
+def cmd_connected_run(args) -> int:
+    """Generate every question afresh on a read-only database, with the replay-repair settings
+    (database errors only, up to --max-repairs). ``--grain`` is the only switch between a
+    control run and a grain run, so a gain is measured on equal terms."""
+    import json as _json
+    import os as _os
+
+    from .benchmark import read_ids
+    from .providers import make_llm
+    from .sql import SQLAgent, open_database
+
+    if args.env_file:
+        from dotenv import load_dotenv
+
+        load_dotenv(args.env_file, override=False)
+    s = Settings.from_env()
+    db = open_database(f"sqlite:///{Path(args.db).resolve()}") if "://" not in args.db else open_database(args.db)
+    agent = SQLAgent(make_llm(s), db=db, max_attempts=1 + args.max_repairs, schema_linking=True,
+                     value_lookup=False, sql_patterns=s.sql_patterns and not args.no_patterns,
+                     answer_checks=False, review=False, grain_plan=args.grain)
+    schema = Path(args.schema).read_text(encoding="utf-8") if args.schema else ""
+    rules = Path(args.rules).read_text(encoding="utf-8") if args.rules else ""
+    keep = set(read_ids(args.ids)) if args.ids else None
+    rows = [_json.loads(x) for x in Path(args.questions).read_text(encoding="utf-8").splitlines() if x.strip()]
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    print(f"model {s.llm_provider}:{s.llm_model} temperature {_os.getenv('DOCQA_TEMPERATURE', 'default')} "
+          f"grain {args.grain}", flush=True)
+    n = 0
+    with open(out, "w", encoding="utf-8") as fh:
+        for row in rows:
+            qid = str(row.get("id") or row.get("question_id"))
+            if keep is not None and qid not in keep:
+                continue
+            start = time.monotonic()
+            r = agent.run(row["question"], context=rules, schema=schema)
+            n += 1
+            rec = {"id": qid, "question": row["question"], "pred_sql": r.sql, "executed": r.ok,
+                   "error": r.error or "", "attempts": r.attempts,
+                   "rechecks": [e for _, e in r.failures if e.startswith("Answer check")] if r.failures else [],
+                   "errors": [e for _, e in r.failures], "mapping": r.mapping,
+                   "seconds": round(time.monotonic() - start, 2)}
+            # only what the agent produced: no gold SQL, no expected rows (they stay with the scorer)
+            fh.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            print(f"[{n}] {qid} {'ok' if r.ok else 'fails'} attempts={r.attempts} {rec['seconds']:.1f}s", flush=True)
+    print(f"\n{n} questions written to {out}. Score it with your own scorer.")
+    return 0
+
+
+def cmd_failures(args) -> int:
+    from .failures import main
+
+    text = main(args.run, args.out, args.holdout)
+    print(text)
+    print(f"Report: {args.out}\nReview sheet: {Path(args.out).with_suffix('.csv')}")
     return 0
 
 
@@ -355,12 +499,72 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--oracle-db", action="store_true", help="give the agent the right database (leaderboard setting)")
     ev.add_argument("--route-only", action="store_true", help="only test database routing; no chat model needed")
     ev.add_argument("--router", choices=["llm", "retrieval"], help="override DOCQA_DB_ROUTER")
-    ev.add_argument("--candidates", type=int, help="databases the router considers (default DOCQA_DB_CANDIDATES=3)")
+    ev.add_argument("--candidates", type=int, help="databases the router considers (default DOCQA_DB_CANDIDATES=5)")
+    ev.add_argument("--route-margin", type=float,
+                    help="schema-fit lead that skips the model's database pick (default DOCQA_ROUTE_MARGIN=0.25; 99 = always ask)")
+    ev.add_argument("--route-choices", type=int, help="the model picks among this many top databases (default DOCQA_ROUTE_CHOICES=2)")
+    ev.add_argument("--no-fit", action="store_true", help="route-only: rank by retrieval alone, without schema/value fit")
     ev.add_argument("--no-embeddings", action="store_true", help="route with keyword search only")
     ev.add_argument("--no-linking", action="store_true", help="skip the schema-linking call (faster, usually less accurate)")
     ev.add_argument("--timeout", type=float, default=30.0, help="seconds per query execution")
     ev.add_argument("--resume", help="continue a results .jsonl from an interrupted run")
+    ev.add_argument("--shots", type=int, default=0, help="show N similar solved training questions per question (DAIL-SQL style)")
+    ev.add_argument("--train", help="folder with the training questions for --shots (default: next to dev.json)")
+    ev.add_argument("--no-values", action="store_true", help="don't look up matching database values")
+    ev.add_argument("--docs", help="a documents folder (one sub-folder per database, e.g. a data dictionary); "
+                    "each question gets the value notes of its database's folder; reference folders (an SQL "
+                    "manual) are shown only when a query fails")
+    ev.add_argument("--docs-full", action="store_true", help="with --docs: whole passages plus a manual page per "
+                    "technique on every question (the round 5b behaviour)")
+    ev.add_argument("--no-checks", action="store_true", help="don't EXPLAIN first or re-ask on suspicious results "
+                    "(empty, all NULL, duplicated rows, percentage outside 0-100)")
+    ev.add_argument("--grain", action="store_true", help="plan the grain and check LEFT JOIN filters and "
+                    "multiplying joins (default DOCQA_SQL_GRAIN=0)")
+    ev.add_argument("--no-shape", action="store_true", help="the plan does not state the answer shape "
+                    "(row entity, measure, denominator, ties); with --no-checks this isolates the schema fix")
+    ev.add_argument("--independent", action="store_true", help="with --sql-candidates N: each extra candidate "
+                    "plans the question afresh; the results show how often any candidate was right")
+    ev.add_argument("--ids", help="a file of question ids (one per line, or a JSON list): run exactly these")
+    ev.add_argument("--exclude-ids", help="leave these question ids out before sampling (e.g. the regression set)")
+    ev.add_argument("--save-ids", help="write the ids of the selected questions to this file (freeze a set)")
+    ev.add_argument("--review", action="store_true", help="the model reviews its own query and first rows and "
+                    "rewrites it once if it says WRONG (one more model call per question)")
+    ev.add_argument("--no-patterns", action="store_true", help="don't show worked examples of SQL techniques")
+    ev.add_argument("--sql-candidates", type=int, help="write N queries and keep the majority result (default DOCQA_SQL_CANDIDATES=1)")
     ev.set_defaults(func=cmd_eval)
+
+    rr = sub.add_parser("replay-repair", help="rerun saved SQL on a read-only database and repair only "
+                        "what it rejects, using the real error (measures what database feedback fixes)")
+    rr.add_argument("--db", required=True, help="SQLite file (opened read-only) or a database URL")
+    rr.add_argument("--rows", required=True, help="saved predictions, JSONL with id, question, pred_sql")
+    rr.add_argument("--schema", help="the schema text the original run gave the model")
+    rr.add_argument("--rules", help="the business rules / context the original run gave the model")
+    rr.add_argument("--ids", help="only these question ids (e.g. the 80 diagnostic ones)")
+    rr.add_argument("--max-repairs", type=int, default=2)
+    rr.add_argument("--no-patterns", action="store_true", help="match a run that had the SQL patterns off")
+    rr.add_argument("--out", required=True)
+    rr.set_defaults(func=cmd_replay_repair)
+
+    cr = sub.add_parser("connected-run", help="answer every question afresh on a read-only database with "
+                        "the replay-repair settings; --grain switches the grain plan and checks on")
+    cr.add_argument("--db", required=True, help="SQLite file (opened read-only) or a database URL")
+    cr.add_argument("--questions", required=True, help="JSONL with id and question (extra fields are ignored)")
+    cr.add_argument("--schema", help="schema text to give the model (default: read from the database)")
+    cr.add_argument("--rules", help="business rules / context to give the model")
+    cr.add_argument("--ids", help="only these question ids (e.g. the 80 diagnostic ones)")
+    cr.add_argument("--max-repairs", type=int, default=2)
+    cr.add_argument("--grain", action="store_true", help="grain plan, key paths and the two grain checks")
+    cr.add_argument("--no-patterns", action="store_true")
+    cr.add_argument("--env-file", help="load settings (model, temperature) from this .env first")
+    cr.add_argument("--out", required=True)
+    cr.set_defaults(func=cmd_connected_run)
+
+    fr = sub.add_parser("failures", help="label SQL failures across runs (from results + DOCQA_TRACE_FILE traces)")
+    fr.add_argument("--run", action="append", required=True,
+                    help="name=results.jsonl[,trace.jsonl]; repeat for several runs")
+    fr.add_argument("--out", default="failure_report.md")
+    fr.add_argument("--holdout", help="a file of question ids to leave out of the diagnosis")
+    fr.set_defaults(func=cmd_failures)
 
     sa = sub.add_parser("sample", help="create sample docs, code, SQL and a SQLite database to try the agent")
     sa.add_argument("folder", nargs="?", default="sample_workspace")

@@ -279,6 +279,173 @@ routes across every database in the folder (all 166 for Spider), which is harder
 the leaderboard setting. A full Spider dev run is ~3 model calls per question; on a
 local 7B model start with `--limit 50 --no-linking` and compare.
 
+### Getting more out of a small local model
+
+Measured on Kiran's PC with `qwen2.5-coder:7b` (2026-11-03, before these features):
+Spider 54% (50 questions, routed across 166 databases), BIRD dev 50% (30 questions).
+The misses were wrong databases, made-up column names, filter values spelled differently
+from the data, and (Spider only) correct answers scored wrong because of column order.
+Each fix below comes from a published text-to-SQL agent:
+
+| Setting | What it does | Idea from | Cost |
+|---|---|---|---|
+| on by default (`DOCQA_SQL_VALUE_LOOKUP=0` or `--no-values` to turn off) | Reads the distinct short text values of every column once per database and tells the model which ones the question mentions: "Commander" becomes `cards.type = 'commander'`, "1:54" becomes `'01:54'` | CHESS (entity and value retrieval), Vanna | a few seconds per database, once |
+| always on | When a query fails with `no such column` / `no such table` / `ambiguous column`, the retry is told the aliased table's real columns, the closest-named columns anywhere, and that names with spaces need quotes | DIN-SQL self-correction, MAC-SQL refiner, CHESS revisor | none |
+| `--shots 4` (eval) | Shows the 4 most similar solved training questions (numbers and values masked before matching) as earlier chat turns. Spider's `train_spider.json` comes with the download; BIRD needs its separate train set | DAIL-SQL | a longer prompt |
+| `DOCQA_SQL_CANDIDATES=3` or `--sql-candidates 3` | Writes 3 queries with different instructions (JOINs, CTEs, re-check columns, keep it simple) and keeps the result most of them return; a non-empty result wins a tie | MCS-SQL, CHASE-SQL (self-consistency) | ~3x time per question |
+| scoring fix | Spider now accepts the same columns in a different order, like Spider's official `exec_eval.py` | test-suite-sql-eval | none |
+
+For your own database the same features apply in `chat`, `ask` and the app; your golden
+SQL file plays the role of the training set.
+
+**Round 2, from the per-question analysis of those runs.** Half of the Spider misses were
+routing (11 of 22), mostly between look-alike databases (flight_1/2/4, three "documents"
+databases); the rest were the model adding columns or filters nobody asked for, grouping
+by name instead of id, skipping a bridge table, and repeating a wrong column name even
+after the hint. So:
+
+* **Routing by fit.** The router now considers 5 candidates (`DOCQA_DB_CANDIDATES`), and
+  each is checked for which question words are its table/column names and which stored
+  values the question mentions. Candidates are reordered by that fit, and the model sees
+  it on each card ("Matches the question: names: airport, city; values:
+  airports.City='Aberdeen '"). `docqa eval spider --route-only` measures it without a chat
+  model; `--no-fit` shows retrieval alone.
+* **Automatic name repair.** When a query fails on a column or table that differs from a
+  real one only in case, underscores or spaces (`indep_year` vs `IndepYear`), or uses the
+  wrong table alias, the name is fixed and the query re-run without another model call.
+* **Stricter rules** in the SQL prompt: only the asked-for columns, no extra filters,
+  group by key not name, join through bridge tables, NOT IN / EXCEPT for negation,
+  ORDER BY ... LIMIT 1 for "the most recent", parentheses around mixed AND/OR.
+* **BIRD evidence with the question.** The per-question hint ("youngest refers to
+  MAX(Birthday)") is now appended to the question, as BIRD's own baselines do, instead of
+  sitting in the context where the 7B model ignored it.
+
+```bash
+docqa eval spider --limit 50 --shots 4                    # values + error hints + 4 examples
+docqa eval spider --limit 50 --shots 4 --sql-candidates 3 # plus voting (slow on a laptop)
+docqa eval bird --limit 30 --no-values                    # measure one feature at a time
+```
+
+**Round 3, from the round-2 Spider run.** The shortlist improved (gold database in the
+top 5 for 94% of questions, schema fit alone puts it first 83.5% of the time), yet the
+final pick got slightly worse: given five look-alike cards, the 7B model overrode a
+correct #1 (employee_hire_evaluation → shop_membership, course_teach → gymnast). So:
+
+* **Trust a clear fit winner.** If #1 leads #2 on schema fit by `DOCQA_ROUTE_MARGIN`
+  (0.25 since round 4), it is used without a model call. Otherwise the model chooses among only the top
+  `DOCQA_ROUTE_CHOICES` (2). `--route-margin 99` restores always asking.
+  `docqa eval spider --route-only` now prints, per margin, how many questions have a clear
+  lead and how often that #1 is right, so the margin can be tuned without a chat model.
+* **"All the information about X"** now means `SELECT * FROM X`, with no joins. This hint is
+  added only to questions that say "all the information / details / data", because as a
+  general rule the model also applied it to single-column questions.
+
+**Round 4, from the round-3 runs** (Spider 66%, BIRD 53.3%). On BIRD the 0.15 margin
+skipped the model on two student_club questions that schema fit had wrong, one of which
+names "Student_Club" outright. Schema fit now counts the database's own name (a full
+multi-word name +0.3, a single word +0.1), and the default margin is 0.25: on 200 Spider
+questions a lead that large covered 54% of questions with #1 right every time.
+
+**SQL pattern library.** `docqa/sql_patterns/` holds 22 SQL techniques, each with five worked
+examples on one small demo shop schema (`demo_schema.sql`): filtering and AND/OR, NULLs, top N,
+aggregation, GROUP BY / HAVING, joins through bridge tables, LEFT JOIN, negation (NOT EXISTS /
+NOT IN / EXCEPT), subqueries, CTEs, ranking per group, running totals and shares, LAG / LEAD,
+set operations, CASE pivots, percentages, dates (SQLite, Postgres and MySQL notes), text
+functions, "the row with the highest", self-joins, recursive hierarchies and DISTINCT. Each
+file says when to use the technique and the usual mistake. For every question the best one or
+two techniques are retrieved by their cue words ("never", "running total", "top ... each") and
+shown to the model with two examples, labelled as a demo schema so it copies the technique and
+not the names. Nothing in it depends on your databases, so it does not go stale when your SQL
+changes. The tests run all 110 examples against the demo database.
+
+Add your own techniques or house rules as more `.md` files in the same format in a folder of
+your choice and set `DOCQA_SQL_PATTERNS_DIR`. Turn the library off with `DOCQA_SQL_PATTERNS=0`
+(`docqa eval ... --no-patterns` to measure it).
+
+**Documents in the SQL eval.** Until now the benchmark passed no documents to the SQL agent.
+`docqa eval bird --docs <folder>` indexes a folder with the app's normal sync (PDF, DOCX, CSV, MD...)
+and gives each question the passages from `<folder>/<database>/` once the agent has picked the
+database (a data dictionary, business rules), plus one page per SQL technique from any other
+folder (a SQL manual), searched by the technique's `manual:` words because a business question
+shares no words with a manual. Pattern examples are now translated into the connected database's
+dialect with sqlglot (Oracle `FETCH FIRST n ROWS ONLY`, SQL Server `TOP n`, ...), and the 30 s query
+limit also applies on Postgres, MySQL and Oracle.
+
+Measured on BIRD 30 with qwen2.5-coder:7b: patterns 66.7%, patterns + whole passages 53.3%. The
+passages came from the right database every time, but four to six of them made the model add
+columns and joins it read about. So `--docs` now gives only the lines that explain values (codes,
+units, meanings) from the top 2 passages, the SQL manual only when a query fails on a function,
+date or syntax error, and a rule that documents explain values and never add columns or joins
+(`--docs-full` restores the old behaviour). The app also shows manual pages only on such errors.
+
+**Answer checks.** Syntax, safety and database errors were already checked and sent back to the
+model. But every wrong answer of the best BIRD run was valid SQL that ran. Now each query is
+`EXPLAIN`ed first (names and syntax, before a heavy query starts), and a result that looks wrong
+is sent back once with what is suspicious: no rows, a column that is NULL in every row, rows
+multiplied by a join, a percentage outside 0-100 or a negative count. Each kind fires at most once
+per question; if the model returns the same query it is accepted, and if the re-ask fails to run
+the first query is kept. `DOCQA_SQL_REVIEW=1` (`--review`) adds a self-review: the model sees its
+query and first rows and answers OK or WRONG with a reason. Turn the checks off with
+`DOCQA_SQL_CHECKS=0` (`--no-checks`).
+
+**What the model sees (round 7).** With BIRD's column descriptions attached, one wide table
+(card_games `cards`, 14,438 characters) filled the 12,000-character schema budget and the other
+five tables were never shown; 3 of the 10 misses of the best run needed a hidden table. The schema
+is now built in layers: every chosen table is named with its primary key and joins first, then its
+CREATE TABLE (or a one-line column list), then column notes (trimmed to the lines about the
+question) and sample rows, most relevant table first. Each result row of `docqa eval` records what
+every table got (`"schema"`), and the summary counts questions where a table was shortened.
+In chat, with one document folder per database, the documents are now fetched for the chosen
+database after routing, as in the eval.
+
+Two mistakes the database accepts are now caught: a condition that compares a column with itself
+(`ON st.setCode = st.setCode`) is sent back with the real join keys, and a text filter on a value
+the column never holds (`Country = 'Slovakia'` where the column stores `SVK`) is sent back with the
+stored values. The planning step now states what one result row is about, the measure, grouping,
+denominator and tie rule ("the score of the oldest player" is one player's score, not a MAX over
+everyone). `--sql-candidates N --independent` plans each candidate afresh, and the summary shows
+how often any candidate was right and how often the agent picked it. The "first row" rule follows
+the dialect (Oracle `FETCH FIRST 1 ROWS ONLY`, SQL Server `TOP 1`), Oracle queries are checked
+with an empty wrapped query (`WHERE 1 = 0`) before they run, and `DOCQA_SCHEMA_TTL` re-reads a
+changing schema during a chat.
+
+**Tracing and failure labels.** `DOCQA_TRACE_FILE=trace.jsonl` appends every SQL model call:
+the run settings once (model, temperature, seed, context window, output limit, agent version),
+then per call the step (plan / generate / repair / review), the exact messages, the raw reply
+before SQL extraction, token counts, stop reason, seconds and a repetition score, plus the SQL
+extracted and each check's verdict. `docqa failures --run r1=results.jsonl,trace.jsonl --run
+r2=... --holdout holdout.txt --out report.md` labels every failure (loop, cut off, invalid SQL,
+missing schema, wrong join / aggregation / filter / columns, unclear), counts labels per run,
+shows which questions are always wrong versus flaky, and writes a CSV with a `reviewed_labels`
+column for the manual pass. `DOCQA_TEMPERATURE`, `DOCQA_SEED` and `DOCQA_NUM_PREDICT` control
+sampling and the output cap.
+
+**What does database feedback repair?** `docqa replay-repair --db northstar.sqlite --rows N1/rows.jsonl
+--schema schema.sql --rules business_rules.md --ids diag80.txt --out C1.jsonl` replays saved predictions
+on a read-only database: a query that runs is kept exactly as saved; one the database rejects goes back
+to the model with the real error (plus the identifier and alias hints) for up to `--max-repairs`
+corrections. No expected rows or answer key reach the agent; score the output with your own scorer.
+
+**Grain and joins** (`DOCQA_SQL_GRAIN=1`, `docqa eval --grain`, off by default until measured). The
+plan names what one counted thing is (an order, a payment, a returned line: taken from the question),
+which tables have several rows per that thing and must be totalled per key in their own CTE before
+joining, which rows must survive (LEFT JOIN, missing totals as zero), and where each status or date
+condition belongs. The planner also sees the key paths between the tables, read from the foreign keys
+(or matching key names), with a note when one table has two keys to the same table (two roles, such as
+who ordered and who is billed): the question decides which. Two checks send a query back once (a query
+returned unchanged is accepted): a WHERE condition on the optional side of a LEFT JOIN, which drops the
+unmatched rows, and a SUM/AVG/COUNT over two tables that both have several rows per the same parent and
+are joined through its key, which multiplies the totals.
+
+`docqa connected-run --db northstar.sqlite --questions questions.jsonl --schema schema.sql --rules
+business_rules.md --ids diag80.txt --max-repairs 2 [--grain] --out G1.jsonl` answers every question afresh
+with the replay-repair settings (database errors only, no answer key); `--grain` is the only difference
+between a control run and a grain run.
+
+For a fair comparison, freeze question sets: `--save-ids` writes the chosen ids, `--ids` runs
+exactly those, and `--exclude-ids` keeps the regression questions out of an unseen set:
+`docqa eval bird --exclude-ids regression30.txt --limit 60 --seed 1 --save-ids unseen60.txt`.
+
 **Changes from the pasted scripts.** The Dropbox Spider link is the old release; the
 downloader uses the Google Drive file linked from the Spider page and, if that moves,
 tells you to download in a browser and pass `--zip`. The schema indexer built `PRAGMA table_info('{t}')`

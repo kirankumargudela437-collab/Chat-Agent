@@ -243,7 +243,8 @@ ROUTER_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             "Pick the ONE database that can answer the question. Candidates, each with its tables, "
-            "columns and example values:\n\n{cards}\n\n"
+            "columns, example values and which words of the question it matches:\n\n{cards}\n\n"
+            "Prefer the database whose tables and columns cover every part of the question.\n"
             "Reply with the database name only, exactly as written after 'Database:'.",
         ),
         ("human", "{question}"),
@@ -352,12 +353,26 @@ class DatabaseCatalog:
         out = [(names[i], round(fused[i], 5)) for i in order]
         return out[:k] if k else out
 
-    def choose(self, question: str, candidates: list[str], llm: BaseChatModel) -> str:
-        """Let the model pick among candidate cards; fall back to the first on a bad reply."""
+    def choose(self, question: str, candidates: list[str], llm: BaseChatModel, evidence: dict[str, str] | None = None) -> str:
+        """Let the model pick among candidate cards; fall back to the first on a bad reply.
+
+        ``evidence`` (per database: which question words are its table/column names and
+        which stored values the question mentions) goes at the top of each card, so
+        look-alike databases are told apart by what they actually contain.
+        """
         if len(candidates) <= 1:
             return candidates[0]
         per = max(800, CARD_CHARS // len(candidates))
-        cards = "\n\n".join(self.cards[n].text[:per] for n in candidates)
+        evidence = evidence or {}
+
+        def card(n):
+            text = self.cards[n].text[:per]
+            if evidence.get(n):
+                first, _, rest = text.partition("\n")
+                text = f"{first}\nMatches the question: {evidence[n]}\n{rest}"
+            return text
+
+        cards = "\n\n".join(card(n) for n in candidates)
         reply = (ROUTER_PROMPT | llm | StrOutputParser()).invoke({"cards": cards, "question": question})
         return match_name(reply, candidates) or candidates[0]
 

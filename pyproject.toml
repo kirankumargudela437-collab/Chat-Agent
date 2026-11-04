@@ -35,3 +35,6 @@ docqa = "docqa.cli:main"
 
 [tool.setuptools]
 packages = ["docqa"]
+
+[tool.setuptools.package-data]
+docqa = ["sql_patterns/*.md", "sql_patterns/*.sql"]

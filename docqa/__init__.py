@@ -48,6 +48,18 @@ def build_sql_agent(settings: Settings, llm=None, catalog=None):
         catalog=catalog,
         db_router=settings.sql_db_router,
         db_candidates=settings.sql_db_candidates,
+        value_lookup=settings.sql_value_lookup,
+        sql_patterns=settings.sql_patterns,
+        patterns_dir=str(settings.sql_patterns_dir) if settings.sql_patterns_dir else None,
+        sql_candidates=settings.sql_candidates,
+        route_margin=settings.sql_route_margin,
+        route_choices=settings.sql_route_choices,
+        answer_checks=settings.sql_answer_checks,
+        review=settings.sql_review,
+        independent_plans=settings.sql_independent_plans,
+        schema_ttl=settings.sql_schema_ttl,
+        answer_shape=settings.sql_answer_shape,
+        grain_plan=settings.sql_grain_plan,
     )
 
 

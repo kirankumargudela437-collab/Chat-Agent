@@ -25,6 +25,10 @@ def make_llm(s: Settings) -> BaseChatModel:
         from langchain_ollama import ChatOllama
 
         kwargs = {"base_url": s.ollama_base_url} if s.ollama_base_url else {}
+        if getattr(s, "seed", None) is not None:
+            kwargs["seed"] = s.seed
+        if getattr(s, "num_predict", None):
+            kwargs["num_predict"] = s.num_predict
         # Ollama's own default window is small and it trims overflow silently.
         return ChatOllama(model=s.llm_model, temperature=s.temperature, num_ctx=s.num_ctx, **kwargs)
     if p == "openai":

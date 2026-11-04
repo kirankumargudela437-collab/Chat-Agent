@@ -200,9 +200,12 @@ def test_sql_agent_fixes_a_failed_query_with_the_database_error(db):
     r = SQLAgent(llm, db).run("Rank customers by net revenue", context="[1] Net revenue counts status 'C' only.")
     assert r.ok and r.executed and r.attempts == 2
     assert r.rows[0] == ("Acme Corp", 23200.0)
-    assert r.failures == [(BAD_COLUMN, "no such column: o.amount")]
+    assert len(r.failures) == 1 and r.failures[0][0] == BAD_COLUMN
+    assert r.failures[0][1].startswith("no such column: o.amount")
     fix_prompt = llm.prompts[2][-1].content
     assert "no such column: o.amount" in fix_prompt and BAD_COLUMN in fix_prompt
+    # the retry is told where the real column is (alias o -> orders, closest name amount_usd)
+    assert "Table orders (alias o) has these columns" in fix_prompt and "orders.amount_usd" in fix_prompt
     # the live schema, the business rules and the mapping all reached the generator
     system = llm.prompts[1][0].content
     assert "CREATE TABLE orders" in system and "status 'C' only" in system and "orders join customers" in system
@@ -401,7 +404,10 @@ def test_small_database_is_shown_whole(db):
 def test_schema_text_respects_the_character_budget(legacy_db):
     agent = SQLAgent(FakeListChatModel(responses=[]), legacy_db, max_tables=33, schema_chars=600)
     text = agent.schema_text("", "users")
-    assert 0 < text.count("CREATE TABLE") < 33 and "more tables not shown" in text
+    assert 0 < text.count("CREATE TABLE") < 33
+    # no chosen table is dropped for space: the rest are named with their keys
+    assert all(f"audit_log_{i}" in text for i in range(5))
+    assert set(agent.last_schema.values()) >= {"ddl", "keys"}
 
 
 def test_table_ranking_uses_embeddings_when_available(legacy_db):
